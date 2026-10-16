@@ -109,3 +109,4 @@ Once flashed via USB-C, choose your board name under **Tools > Port > Network Po
        Ensure an explicit jumper joins an ESP32 GND node directly to a 
        HUB75 GND pin or the screen graphics will render as scrolling noise!
 
+///
