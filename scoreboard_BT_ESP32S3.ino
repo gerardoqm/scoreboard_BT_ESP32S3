@@ -15,9 +15,8 @@
 MatrixPanel_I2S_DMA *dma_display = nullptr;
 Preferences prefs;
 
-// Type in your exact local home Wi-Fi network credentials here
-const char* ssid = "";
-const char* password = "";
+// Wi-Fi and OTA credentials live in secrets.h (gitignored). Copy secrets.h.example to create it.
+#include "secrets.h"
 
 // Safe Exposed ESP32-S3 HUB75 GPIO Pins
 #define R1_PIN 1
@@ -123,7 +122,7 @@ class FullControlCallbacks: public BLECharacteristicCallbacks {
             homeScore      = rawData[0];
             awayScore      = rawData[1];
             period         = rawData[2];
-            brightness     = rawData[3];
+            brightness     = constrain(rawData[3], 10, 120); // same range as the app's slider
             timerMin       = rawData[4];
             timerSec       = rawData[5];
             isTimerRunning = (rawData[6] == 1);
@@ -143,12 +142,8 @@ class FullControlCallbacks: public BLECharacteristicCallbacks {
                     awayName = payload.substring(pipe1 + 1, pipe2).substring(0, 4);
                     if (pipe3 != -1) {
                         periodRatio = payload.substring(pipe2 + 1, pipe3).substring(0, 3);
-                        String incomingDeviceName = payload.substring(pipe3 + 1);
-                        if (incomingDeviceName.length() > 0 && incomingDeviceName != deviceBroadcastName) {
-                            deviceBroadcastName = incomingDeviceName;
-                            prefs.begin("scoreboard", false); prefs.putString("devName", deviceBroadcastName); prefs.end();
-                            delay(500); esp_restart(); 
-                        }
+                        // Field 4 is the bottom-line label (e.g. "1st Period 10:00"), never a device name.
+                        bottomClockString = payload.substring(pipe3 + 1).substring(0, 31);
                     } else { periodRatio = payload.substring(pipe2 + 1); }
                 }
             }
@@ -180,12 +175,13 @@ void setup() {
 
   // 📡 SILENT BACKGROUND WI-FI OTA INITIALIZATION
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   
   // Set up local Arduino OTA network port name
   char otaNameBuffer[32];
   deviceBroadcastName.toCharArray(otaNameBuffer, 32);
   ArduinoOTA.setHostname(otaNameBuffer);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
 
   ArduinoOTA.onStart([]() { Serial.println("Wireless flashing started..."); });
   ArduinoOTA.onEnd([]() { Serial.println("\nWireless flash complete! Rebooting..."); });
