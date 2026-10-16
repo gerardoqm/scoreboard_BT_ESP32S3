@@ -52,10 +52,19 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 #define CFG_NOTHING_STAGED 0x02
 #define DEVICE_NAME_MAX 20
 
+// Protocol version reported in the telemetry notification. Bump when the packet layout changes.
+// Telemetry (5 bytes in v1): [min, sec, running, period, battery%]
+// v2 adds:                    [flags, protocolVersion]  (7 bytes)
+#define PROTOCOL_VERSION 2
+#define FLAG_LOW_BATTERY    0x01  // battery below 15%
+#define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
+#define PANEL_LABEL_MAX 13        // 80px panel / 6px per character
+
 // Core Board Counters
 int homeScore = 0, awayScore = 0, period = 1, totalPeriods = 4, brightness = 40;
 int timerMin = 10, timerSec = 0, batteryPct = 100;
 bool isTimerRunning = false;
+bool hasReceivedState = false;  // false until the phone sends its first state packet this session
 
 enum BLEState { SEARCHING_NEW, RETRYING_PAST, LINKED_CONNECTED };
 BLEState currentBLEState = SEARCHING_NEW;
@@ -109,14 +118,15 @@ void drawScoreboard() {
   } else {
     dma_display->setTextColor(dma_display->color565(255, 120, 0)); 
   }
+  dma_display->setTextWrap(false);
   dma_display->setCursor(2, 30);
-  dma_display->print(bottomClockString);
+  dma_display->print(bottomClockString.substring(0, PANEL_LABEL_MAX));
 }
 
 class ScoreboardServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) { currentBLEState = LINKED_CONNECTED; statusLED.setPixelColor(0, statusLED.Color(0, 150, 0)); statusLED.show(); }
     void onDisconnect(BLEServer* pServer) {
-        if (homeScore == 0 && awayScore == 0 && period == 1 && homeName == "HOME") { currentBLEState = SEARCHING_NEW; } 
+        if (!hasReceivedState) { currentBLEState = SEARCHING_NEW; } 
         else { currentBLEState = RETRYING_PAST; stateTransitionMillis = millis(); }
         statusLED.setPixelColor(0, statusLED.Color(0, 0, 0)); statusLED.show();
         delay(200); pServer->startAdvertising();
@@ -130,6 +140,7 @@ class FullControlCallbacks: public BLECharacteristicCallbacks {
         
         if (dataLength >= 8) { 
             // FIXED: Added precise index tracking matrix brackets to extract individual bytes
+            hasReceivedState = true;
             homeScore      = rawData[0];
             awayScore      = rawData[1];
             period         = rawData[2];
@@ -279,8 +290,9 @@ void loop() {
      batteryPct = readBatteryPercentage();
      
      // FIXED: Added array assignment tracking brackets to structure multi-byte list payloads
-     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct };
-     pChar->setValue(telemetryPacket, 5); pChar->notify();
+     uint8_t flags = (batteryPct < 15 ? FLAG_LOW_BATTERY : 0) | (pendingDeviceName.length() > 0 ? FLAG_RENAME_STAGED : 0);
+     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct, flags, PROTOCOL_VERSION };
+     pChar->setValue(telemetryPacket, sizeof(telemetryPacket)); pChar->notify();
   }
 
   if (currentMillis - lastBlinkMillis >= 400) {
@@ -294,6 +306,7 @@ void loop() {
       statusLED.setPixelColor(0, blinkToggleState ? statusLED.Color(0, 150, 200) : statusLED.Color(0, 0, 0)); statusLED.show();
       if (currentMillis - stateTransitionMillis >= 30000) {
         currentBLEState = SEARCHING_NEW;
+        hasReceivedState = false;
         homeScore = 0; awayScore = 0; period = 1; homeName = "HOME"; awayName = "AWAY"; periodRatio = "1/4"; bottomClockString = "00:00";
         drawScoreboard();
       }

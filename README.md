@@ -10,7 +10,7 @@ This repository contains the resilient, optimized C++ firmware required to trans
   - *Searching:* Onboard RGB NeoPixel blinks **Solid Blue**.
   - *Connected:* Transitions cleanly to **Solid Green**.
   - *Accidental Dropout:* Blinks **Cyan (Blue/Green Mix)** for 30 seconds while waiting to catch its previous companion phone. If the 30-second window expires, it wipes its display to zero parameters and opens the airwaves for a clean connection.
-- **Analog Battery Monitoring:** Continuously samples raw analog cell voltages through an optimized 10-sample rolling average function on **GPIO 18**, translating the LiPo discharge curve safely into a `0%-100%` wireless notify data stream.
+- **Analog Battery Monitoring:** Continuously samples raw analog cell voltages through an optimized 10-sample rolling average function on **GPIO 18**, scaling the cell voltage linearly from 3.4 V (0%) to 4.2 V (100%) and sending it in the BLE telemetry notification. The divider halves the voltage, so the firmware doubles the reading.
 - **Silent Network IDE OTA Programming:** Runs a background `ArduinoOTA` server. After the initial wire flash, your board registers wirelessly inside your Arduino IDE as a **Network Port**, allowing you to update the board over Wi-Fi without un-boxing the enclosure housing.
 
 ## 🔌 Hardware Pin Mapping Blueprint
@@ -52,14 +52,66 @@ To prevent flash memory restriction errors (`[Errno 32] Broken Pipe`), apply the
 - **Upload Mode:** `UART0 / Hardware CDC`
 - **USB CDC On Boot:** `Enabled`
 
-### Network Credentials (OTA Setup)
-Enter your local router configurations directly into lines **17 and 18** of the code:
-```cpp
-const char* ssid = "YOUR_HOME_WIFI_NAME";
-const char* password = "YOUR_WIFI_PASSWORD";
-```
-Once flashed via USB-C, choose your board name under **Tools > Port > Network Ports** and provide the default security password **`1234`** to push future changes wirelessly!
+### Network Credentials & OTA Setup
+Wi-Fi and OTA credentials are kept out of the sketch in a **gitignored** `secrets.h`:
 
+1. Copy `secrets.h.example` to `secrets.h` (same folder as the `.ino`).
+2. Fill in `WIFI_SSID`, `WIFI_PASSWORD` and choose your own `OTA_PASSWORD`.
+3. Flash once over USB-C. Afterwards pick the board under **Tools > Port > Network Ports** and enter your OTA password to update wirelessly.
+
+`secrets.h` is listed in `.gitignore`; never commit it.
+
+## 📡 Bluetooth LE Protocol
+
+One service, two characteristics. Keep these tables in sync with `AdvancedBLEManager.swift` in the BLEScoreboard app.
+
+| Item | UUID |
+| :--- | :--- |
+| Service | `12345678-1234-1234-1234-123456789012` |
+| State characteristic (read / write / notify) | `87654321-4321-4321-4321-210987654321` |
+| Config characteristic (write / notify) | `87654321-4321-4321-4321-210987654322` |
+
+### State: phone → board (write, 8 bytes + optional text)
+
+| Byte | Field | Notes |
+| :--- | :--- | :--- |
+| 0 | Home score | 0-255 (the app limits it to 0-99) |
+| 1 | Away score | same |
+| 2 | Period | |
+| 3 | Brightness | clamped by the firmware to 10-120 |
+| 4 | Timer minutes | |
+| 5 | Timer seconds | |
+| 6 | Timer running | `1` = running |
+| 7 | Total periods | |
+| 8+ | Text (optional) | ASCII `home\|away\|ratio\|bottomLabel` |
+
+Names are cut to 4 characters, the ratio to 3, and the bottom label to 13 (the width of the panel). The text must be plain ASCII because the panel font has no accents; the app strips them. Writes shorter than 8 bytes are ignored.
+
+### Telemetry: board → phone (notify every 2 s while connected)
+
+| Byte | Field | Notes |
+| :--- | :--- | :--- |
+| 0 | Timer minutes | |
+| 1 | Timer seconds | |
+| 2 | Timer running | |
+| 3 | Period | |
+| 4 | Battery % | 0-100 |
+| 5 | Flags | bit 0 = battery below 15%, bit 1 = a new name is staged |
+| 6 | Protocol version | currently `2`; bytes 5-6 are absent on version 1 firmware |
+
+The app shows "firmware outdated" when it receives a shorter packet or a lower version than it expects. Bump `PROTOCOL_VERSION` in the sketch and `expectedProtocolVersion` in the app together whenever a layout changes.
+
+### Config: renaming the board
+
+Write `[command, args...]` to the config characteristic; each command is answered by a `[command, status]` notification (status `0` = OK, `1` = bad argument, `2` = nothing staged).
+
+| Command | Bytes | Effect |
+| :--- | :--- | :--- |
+| `0x01` Set name | `01` + 1-20 printable ASCII bytes | Stages the name; nothing is saved yet |
+| `0x02` Apply | `02` | Saves the staged name to flash and reboots |
+
+### Connection states
+After the first state packet of a session, an unexpected disconnect starts a 30 second cyan "retrying" window for the same phone. If no state was received yet, or the window expires, the board returns to blue "searching" and resets the display.
 
  🔋 CORE POWER & TELEMETRY HUB BLUEPRINT
  ───────────────────────────────────────
