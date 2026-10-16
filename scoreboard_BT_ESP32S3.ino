@@ -42,6 +42,15 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789012"
 #define CHARACTERISTIC_UUID "87654321-4321-4321-4321-210987654321"
+// CONFIG characteristic: [cmd, args...] writes, [cmd, status] notifications (status 0 = OK).
+// Keep in sync with AdvancedBLEManager.swift.
+#define CONFIG_UUID         "87654321-4321-4321-4321-210987654322"
+#define CMD_SET_NAME 0x01   // args: 1-20 printable ASCII bytes; staged, not saved yet
+#define CMD_APPLY    0x02   // saves the staged name and reboots
+#define CFG_OK       0x00
+#define CFG_BAD_ARG  0x01
+#define CFG_NOTHING_STAGED 0x02
+#define DEVICE_NAME_MAX 20
 
 // Core Board Counters
 int homeScore = 0, awayScore = 0, period = 1, totalPeriods = 4, brightness = 40;
@@ -63,6 +72,8 @@ String deviceBroadcastName = "Scoreboard_Beta";
 
 BLEServer *pServer = nullptr;
 BLECharacteristic *pChar = nullptr;
+BLECharacteristic *pConfigChar = nullptr;
+String pendingDeviceName = "";
 
 int readBatteryPercentage() {
   long rawSum = 0;
@@ -152,6 +163,44 @@ class FullControlCallbacks: public BLECharacteristicCallbacks {
     }
 };
 
+class ConfigCallbacks: public BLECharacteristicCallbacks {
+    void reply(uint8_t cmd, uint8_t status) {
+        uint8_t resp[2] = { cmd, status };
+        pConfigChar->setValue(resp, 2);
+        pConfigChar->notify();
+    }
+
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        uint8_t* data = pCharacteristic->getData();
+        size_t len = pCharacteristic->getLength();
+        if (len < 1) return;
+
+        switch (data[0]) {
+            case CMD_SET_NAME: {
+                size_t nameLen = len - 1;
+                bool valid = nameLen >= 1 && nameLen <= DEVICE_NAME_MAX;
+                for (size_t i = 1; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E); }
+                if (!valid) { reply(CMD_SET_NAME, CFG_BAD_ARG); return; }
+                pendingDeviceName = "";
+                for (size_t i = 1; i < len; i++) { pendingDeviceName += (char)data[i]; }
+                reply(CMD_SET_NAME, CFG_OK);
+                break;
+            }
+            case CMD_APPLY: {
+                if (pendingDeviceName.length() == 0) { reply(CMD_APPLY, CFG_NOTHING_STAGED); return; }
+                deviceBroadcastName = pendingDeviceName;
+                pendingDeviceName = "";
+                prefs.begin("scoreboard", false); prefs.putString("devName", deviceBroadcastName); prefs.end();
+                reply(CMD_APPLY, CFG_OK);
+                delay(500); esp_restart();
+                break;
+            }
+            default:
+                reply(data[0], CFG_BAD_ARG);
+        }
+    }
+};
+
 void setup() {
   Serial.begin(115200);
   analogSetAttenuation(ADC_11db); 
@@ -201,7 +250,13 @@ void setup() {
                         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
                       );
 
-  pChar->setCallbacks(new FullControlCallbacks()); 
+  pChar->setCallbacks(new FullControlCallbacks());
+
+  pConfigChar = pService->createCharacteristic(
+                        CONFIG_UUID,
+                        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+                      );
+  pConfigChar->setCallbacks(new ConfigCallbacks());
   pService->start();
   
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
