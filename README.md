@@ -113,55 +113,15 @@ Write `[command, args...]` to the config characteristic; each command is answere
 ### Connection states
 After the first state packet of a session, an unexpected disconnect starts a 30 second cyan "retrying" window for the same phone. If no state was received yet, or the window expires, the board returns to blue "searching" and resets the display.
 
- 🔋 CORE POWER & TELEMETRY HUB BLUEPRINT
- ───────────────────────────────────────
-                                    ┌──────────────────────────────────┐
-                                    │  10kΩ Resistor Divider Circuit   │
-                                    │                                  │
-                                    │ [LiPo BAT+] ───[ 10kΩ Resistor ] │
-                                    │                        │         │
-                                    │                        ├───► GPIO 18 (ADC Input)
-                                    │                        │         │
-                                    │  [ Board GND ] ──[ 10kΩ Resistor ] │
-                                    └──────────────────────────────────┘
-                                                          │
-                                                          ▼
- [ Raw 3.7V - 4.2V Lithium Ion Battery Cell ] ────────────┴─────────────────────┐
-           │                                                                    │
-           ├───► [ TP4056 Boost Board ] ──► (Stable 5.0V VOUT) ──► To ESP32-S3  │
-           │                                                       5V Power Pin │
-           │                                                                    │
-           └───► [ Round Volt/Amp Gauge ] ──► (Casing Exterior Monitor Display)  │
-                                                                                │
- └──────────────────────────────────────────────────────────────────────────────┘
-           │
-           └───► [ XL6009 Boost Module ] ──► (Calibrated 5.0V VCC) ──► To P4 Panel
-                                                                       Screw Blocks
-                                                                             │
-     ┌───────────────────────────────────────────────────────────────────────┘
-     ▼
- 🎨 HUB75 DATA DATA BUS SIGNAL PATH
- ──────────────────────────────────
- Look directly into the back socket of your P4 panel (numbered 1-16, top-left to bottom-right):
+## 🔌 Wiring Blueprint
 
-                      HUB75 Connector Pin Mapping
-                     +---------------------------+
-          R1 (Red)   |  (1)  [GPIO 1]   (2)  [GPIO 2]  | G1 (Green)
-          B1 (Blue)  |  (3)  [GPIO 3]   (4)  [GND]     | GND (Reference)
-          R2 (Red)   |  (5)  [GPIO 4]   (6)  [GPIO 5]  | G2 (Green)
-          B2 (Blue)  |  (7)  [GPIO 6]   (8)  [GND]     | GND (Reference)
-          A (Line)   |  (9)  [GPIO 7]   (10) [GPIO 8]  | B (Line)
-          C (Line)   |  (11) [GPIO 9]   (12) [GPIO 10] | D (Line)
-          CLK (Clock)|  (13) [GPIO 14]  (14) [GPIO 12] | LAT (Latch Data)
-          OE (Enable)|  (15) [GPIO 13]  (16) [GPIO 11] | E (1/20 Line Select)
-                     +---------------------------+
-                                         │
-                                         ▼
-                   🚨 CRITICAL MAPPING CHECKPOINT S3 🚨
-       Ensure an explicit jumper joins an ESP32 GND node directly to a 
-       HUB75 GND pin or the screen graphics will render as scrolling noise!
+### Power and battery telemetry
 
-///
+<p align="center"><img src="docs/power-blueprint.svg" alt="Power diagram: LiPo cell feeding the TP4056 board for the ESP32-S3, the XL6009 boost for the LED panel, a volt/amp gauge, and the 10k resistor divider on GPIO 18" width="760"></p>
+
+### HUB75 connector
+
+<p align="center"><img src="docs/hub75-pinout.svg" alt="HUB75 connector pinout showing each of the 16 pins and the ESP32-S3 GPIO it connects to" width="680"></p>
 
 ## 🔋 Battery Sizing
 

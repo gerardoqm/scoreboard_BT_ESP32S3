@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 800" font-family="-apple-system, Helvetica, Arial, sans-serif">
+  <rect width="900" height="800" fill="#ffffff"/>
+  <text x="450" y="36" text-anchor="middle" font-size="24" font-weight="700" fill="#1e272e">HUB75 connector to ESP32-S3</text>
+  <text x="450" y="60" text-anchor="middle" font-size="14" fill="#636e72">Looking at the back socket of the panel, pins numbered 1-16 left to right, top to bottom</text>
+
+  <g transform="translate(0,70)">
+  <!-- connector body -->
+  <rect x="330" y="86" width="240" height="560" rx="16" fill="#2d3436"/>
+  <rect x="430" y="76" width="40" height="14" rx="4" fill="#ffffff"/>
+  <text x="450" y="104" text-anchor="middle" font-size="11" fill="#b2bec3">key</text>
+  <g font-family="Helvetica, Arial, sans-serif" text-anchor="middle" font-weight="700" font-size="15" fill="#ffffff">
+    <!-- rows: y centers 140 + 67*i ; left col x=385, right col x=515 -->
+    <circle cx="385" cy="140" r="21" fill="#d63031"/><text x="385" y="146">1</text>
+    <circle cx="515" cy="140" r="21" fill="#00a86b"/><text x="515" y="146">2</text>
+    <circle cx="385" cy="207" r="21" fill="#2f6fed"/><text x="385" y="213">3</text>
+    <circle cx="515" cy="207" r="21" fill="#636e72"/><text x="515" y="213">4</text>
+    <circle cx="385" cy="274" r="21" fill="#d63031"/><text x="385" y="280">5</text>
+    <circle cx="515" cy="274" r="21" fill="#00a86b"/><text x="515" y="280">6</text>
+    <circle cx="385" cy="341" r="21" fill="#2f6fed"/><text x="385" y="347">7</text>
+    <circle cx="515" cy="341" r="21" fill="#636e72"/><text x="515" y="347">8</text>
+    <circle cx="385" cy="408" r="21" fill="#8e44ad"/><text x="385" y="414">9</text>
+    <circle cx="515" cy="408" r="21" fill="#8e44ad"/><text x="515" y="414">10</text>
+    <circle cx="385" cy="475" r="21" fill="#8e44ad"/><text x="385" y="481">11</text>
+    <circle cx="515" cy="475" r="21" fill="#8e44ad"/><text x="515" y="481">12</text>
+    <circle cx="385" cy="542" r="21" fill="#e67e22"/><text x="385" y="548">13</text>
+    <circle cx="515" cy="542" r="21" fill="#e67e22"/><text x="515" y="548">14</text>
+    <circle cx="385" cy="609" r="21" fill="#e67e22"/><text x="385" y="615">15</text>
+    <circle cx="515" cy="609" r="21" fill="#8e44ad"/><text x="515" y="615">16</text>
+  </g>
+
+  <!-- left labels (odd pins) -->
+  <g font-size="17" fill="#1e272e" text-anchor="end">
+    <text x="312" y="134" font-weight="700">R1 (top red)</text><text x="312" y="154" font-size="14" fill="#636e72">GPIO 1</text>
+    <text x="312" y="201" font-weight="700">B1 (top blue)</text><text x="312" y="221" font-size="14" fill="#636e72">GPIO 3</text>
+    <text x="312" y="268" font-weight="700">R2 (bottom red)</text><text x="312" y="288" font-size="14" fill="#636e72">GPIO 4</text>
+    <text x="312" y="335" font-weight="700">B2 (bottom blue)</text><text x="312" y="355" font-size="14" fill="#636e72">GPIO 6</text>
+    <text x="312" y="402" font-weight="700">A (row select)</text><text x="312" y="422" font-size="14" fill="#636e72">GPIO 7</text>
+    <text x="312" y="469" font-weight="700">C (row select)</text><text x="312" y="489" font-size="14" fill="#636e72">GPIO 9</text>
+    <text x="312" y="536" font-weight="700">CLK (clock)</text><text x="312" y="556" font-size="14" fill="#636e72">GPIO 14</text>
+    <text x="312" y="603" font-weight="700">OE (output enable)</text><text x="312" y="623" font-size="14" fill="#636e72">GPIO 13</text>
+  </g>
+  <!-- right labels (even pins) -->
+  <g font-size="17" fill="#1e272e" text-anchor="start">
+    <text x="588" y="134" font-weight="700">G1 (top green)</text><text x="588" y="154" font-size="14" fill="#636e72">GPIO 2</text>
+    <text x="588" y="201" font-weight="700">GND</text><text x="588" y="221" font-size="14" fill="#636e72">any board GND</text>
+    <text x="588" y="268" font-weight="700">G2 (bottom green)</text><text x="588" y="288" font-size="14" fill="#636e72">GPIO 5</text>
+    <text x="588" y="335" font-weight="700">GND</text><text x="588" y="355" font-size="14" fill="#636e72">any board GND</text>
+    <text x="588" y="402" font-weight="700">B (row select)</text><text x="588" y="422" font-size="14" fill="#636e72">GPIO 8</text>
+    <text x="588" y="469" font-weight="700">D (row select)</text><text x="588" y="489" font-size="14" fill="#636e72">GPIO 10</text>
+    <text x="588" y="536" font-weight="700">LAT (latch)</text><text x="588" y="556" font-size="14" fill="#636e72">GPIO 12</text>
+    <text x="588" y="603" font-weight="700">E (5th row select)</text><text x="588" y="623" font-size="14" fill="#636e72">GPIO 11</text>
+  </g>
+
+  </g>
+
+  <!-- legend -->
+  <g font-size="14" fill="#2d3436">
+    <circle cx="60" cy="770" r="8" fill="#d63031"/><text x="76" y="775">red data</text>
+    <circle cx="170" cy="770" r="8" fill="#00a86b"/><text x="186" y="775">green data</text>
+    <circle cx="290" cy="770" r="8" fill="#2f6fed"/><text x="306" y="775">blue data</text>
+    <circle cx="400" cy="770" r="8" fill="#8e44ad"/><text x="416" y="775">row select</text>
+    <circle cx="520" cy="770" r="8" fill="#e67e22"/><text x="536" y="775">clock / latch / enable</text>
+    <circle cx="700" cy="770" r="8" fill="#636e72"/><text x="716" y="775">ground</text>
+  </g>
+
+  <!-- critical callout -->
+  <rect x="130" y="78" width="640" height="64" rx="12" fill="#ffecec" stroke="#d63031" stroke-width="3"/>
+  <text x="450" y="104" text-anchor="middle" font-size="16" font-weight="700" fill="#d63031">Critical: share a ground</text>
+  <text x="450" y="126" text-anchor="middle" font-size="14" fill="#2d3436">Join an ESP32 GND to a HUB75 GND pin, or the display shows scrolling noise.</text>
+</svg>
