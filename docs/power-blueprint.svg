@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 720" font-family="-apple-system, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrRed" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="14" markerHeight="14" markerUnits="userSpaceOnUse" orient="auto"><path d="M0 0L10 5L0 10z" fill="#d63031"/></marker>
+    <marker id="arrGreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="14" markerHeight="14" markerUnits="userSpaceOnUse" orient="auto"><path d="M0 0L10 5L0 10z" fill="#00a86b"/></marker>
+  </defs>
+  <rect width="960" height="720" fill="#ffffff"/>
+  <text x="480" y="38" text-anchor="middle" font-size="24" font-weight="700" fill="#1e272e">Power and battery telemetry</text>
+
+  <!-- legend -->
+  <g font-size="14" fill="#2d3436">
+    <line x1="80" y1="66" x2="116" y2="66" stroke="#d63031" stroke-width="4"/><text x="124" y="71">power (+)</text>
+    <line x1="230" y1="66" x2="266" y2="66" stroke="#2d3436" stroke-width="4"/><text x="274" y="71">ground</text>
+    <line x1="350" y1="66" x2="386" y2="66" stroke="#00a86b" stroke-width="4"/><text x="394" y="71">signal</text>
+  </g>
+
+  <!-- battery -->
+  <rect x="40" y="215" width="170" height="120" rx="14" fill="#fff4e0" stroke="#e67e22" stroke-width="3"/>
+  <text x="125" y="260" text-anchor="middle" font-size="20" font-weight="700" fill="#1e272e">LiPo cell</text>
+  <text x="125" y="285" text-anchor="middle" font-size="16" fill="#2d3436">3.7 - 4.2 V</text>
+  <text x="125" y="308" text-anchor="middle" font-size="14" fill="#636e72">protected pack + fuse</text>
+
+  <!-- power bus -->
+  <line x1="210" y1="260" x2="262" y2="260" stroke="#d63031" stroke-width="4"/>
+  <line x1="262" y1="130" x2="262" y2="430" stroke="#d63031" stroke-width="4"/>
+  <line x1="262" y1="130" x2="330" y2="130" stroke="#d63031" stroke-width="4"/>
+  <line x1="262" y1="290" x2="330" y2="290" stroke="#d63031" stroke-width="4"/>
+  <line x1="262" y1="430" x2="330" y2="430" stroke="#d63031" stroke-width="4"/>
+  <circle cx="262" cy="260" r="6" fill="#d63031"/>
+
+  <!-- TP4056 -> ESP32 -->
+  <rect x="330" y="90" width="210" height="80" rx="12" fill="#e8f1ff" stroke="#2f6fed" stroke-width="3"/>
+  <text x="435" y="124" text-anchor="middle" font-size="18" font-weight="700" fill="#1e272e">TP4056 board</text>
+  <text x="435" y="148" text-anchor="middle" font-size="14" fill="#2d3436">charge + boost, 5.0 V out</text>
+  <line x1="540" y1="130" x2="640" y2="130" stroke="#d63031" stroke-width="4" marker-end="url(#arrRed)"/>
+  <text x="590" y="120" text-anchor="middle" font-size="13" fill="#d63031">5 V</text>
+
+  <rect x="650" y="75" width="260" height="110" rx="14" fill="#eaf8ef" stroke="#00a86b" stroke-width="3"/>
+  <text x="780" y="112" text-anchor="middle" font-size="20" font-weight="700" fill="#1e272e">ESP32-S3 N16R8</text>
+  <text x="780" y="137" text-anchor="middle" font-size="14" fill="#2d3436">5 V pin: power</text>
+  <text x="780" y="160" text-anchor="middle" font-size="14" fill="#2d3436">GPIO 18: battery sense (ADC)</text>
+
+  <!-- XL6009 -> panel -->
+  <rect x="330" y="250" width="210" height="80" rx="12" fill="#e8f1ff" stroke="#2f6fed" stroke-width="3"/>
+  <text x="435" y="284" text-anchor="middle" font-size="18" font-weight="700" fill="#1e272e">XL6009 boost</text>
+  <text x="435" y="308" text-anchor="middle" font-size="14" fill="#2d3436">calibrated 5.0 V, panel only</text>
+  <line x1="540" y1="290" x2="640" y2="290" stroke="#d63031" stroke-width="4" marker-end="url(#arrRed)"/>
+  <text x="590" y="280" text-anchor="middle" font-size="13" fill="#d63031">5 V</text>
+
+  <rect x="650" y="235" width="260" height="110" rx="14" fill="#f3ecff" stroke="#8e44ad" stroke-width="3"/>
+  <text x="780" y="272" text-anchor="middle" font-size="20" font-weight="700" fill="#1e272e">P4 80x40 LED panel</text>
+  <text x="780" y="297" text-anchor="middle" font-size="14" fill="#2d3436">screw terminals: power</text>
+  <text x="780" y="320" text-anchor="middle" font-size="14" fill="#2d3436">HUB75 ribbon: data</text>
+
+  <!-- common ground -->
+  <line x1="780" y1="185" x2="780" y2="235" stroke="#2d3436" stroke-width="4" stroke-dasharray="8 6"/>
+  <rect x="575" y="193" width="195" height="34" rx="8" fill="#ffecec" stroke="#d63031" stroke-width="2"/>
+  <line x1="770" y1="210" x2="780" y2="210" stroke="#d63031" stroke-width="2"/>
+  <text x="672" y="215" text-anchor="middle" font-size="13" font-weight="700" fill="#d63031">Common GND (required)</text>
+
+  <!-- gauge -->
+  <rect x="330" y="395" width="210" height="70" rx="12" fill="#f4f4f4" stroke="#7f8c8d" stroke-width="3"/>
+  <text x="435" y="425" text-anchor="middle" font-size="18" font-weight="700" fill="#1e272e">Volt/amp gauge</text>
+  <text x="435" y="448" text-anchor="middle" font-size="14" fill="#2d3436">pack voltage and current</text>
+
+  <!-- divider section -->
+  <line x1="40" y1="505" x2="920" y2="505" stroke="#dfe6e9" stroke-width="2"/>
+  <text x="40" y="540" font-size="20" font-weight="700" fill="#1e272e">Battery voltage divider (telemetry)</text>
+
+  <!-- BAT+ to R1 to node to R2 to GND, drawn horizontally -->
+  <text x="40" y="607" font-size="16" font-weight="700" fill="#d63031">BAT+</text>
+  <line x1="95" y1="602" x2="170" y2="602" stroke="#d63031" stroke-width="4"/>
+  <rect x="170" y="584" width="110" height="36" rx="6" fill="#fff" stroke="#2d3436" stroke-width="3"/>
+  <text x="225" y="608" text-anchor="middle" font-size="16" fill="#1e272e">10 kΩ</text>
+  <line x1="280" y1="602" x2="340" y2="602" stroke="#00a86b" stroke-width="4"/>
+  <circle cx="340" cy="602" r="7" fill="#00a86b"/>
+  <line x1="340" y1="602" x2="410" y2="602" stroke="#00a86b" stroke-width="4"/>
+  <rect x="410" y="584" width="110" height="36" rx="6" fill="#fff" stroke="#2d3436" stroke-width="3"/>
+  <text x="465" y="608" text-anchor="middle" font-size="16" fill="#1e272e">10 kΩ</text>
+  <line x1="520" y1="602" x2="580" y2="602" stroke="#2d3436" stroke-width="4"/>
+  <text x="590" y="608" font-size="16" font-weight="700" fill="#2d3436">GND</text>
+
+  <line x1="340" y1="602" x2="340" y2="660" stroke="#00a86b" stroke-width="4"/>
+  <line x1="340" y1="660" x2="640" y2="660" stroke="#00a86b" stroke-width="4" marker-end="url(#arrGreen)"/>
+  <rect x="650" y="636" width="260" height="48" rx="10" fill="#eaf8ef" stroke="#00a86b" stroke-width="3"/>
+  <text x="780" y="666" text-anchor="middle" font-size="16" font-weight="700" fill="#1e272e">ESP32-S3 GPIO 18 (ADC)</text>
+  <text x="352" y="650" font-size="13" fill="#2d3436">midpoint = half the battery voltage</text>
+  <text x="40" y="705" font-size="13" fill="#636e72">The firmware doubles the reading and maps 3.4 V (0%) to 4.2 V (100%) in a straight line.</text>
+</svg>

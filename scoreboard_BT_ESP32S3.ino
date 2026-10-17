@@ -15,9 +15,8 @@
 MatrixPanel_I2S_DMA *dma_display = nullptr;
 Preferences prefs;
 
-// Type in your exact local home Wi-Fi network credentials here
-const char* ssid = "";
-const char* password = "";
+// Wi-Fi and OTA credentials live in secrets.h (gitignored). Copy secrets.h.example to create it.
+#include "secrets.h"
 
 // Safe Exposed ESP32-S3 HUB75 GPIO Pins
 #define R1_PIN 1
@@ -43,11 +42,29 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789012"
 #define CHARACTERISTIC_UUID "87654321-4321-4321-4321-210987654321"
+// CONFIG characteristic: [cmd, args...] writes, [cmd, status] notifications (status 0 = OK).
+// Keep in sync with AdvancedBLEManager.swift.
+#define CONFIG_UUID         "87654321-4321-4321-4321-210987654322"
+#define CMD_SET_NAME 0x01   // args: 1-20 printable ASCII bytes; staged, not saved yet
+#define CMD_APPLY    0x02   // saves the staged name and reboots
+#define CFG_OK       0x00
+#define CFG_BAD_ARG  0x01
+#define CFG_NOTHING_STAGED 0x02
+#define DEVICE_NAME_MAX 20
+
+// Protocol version reported in the telemetry notification. Bump when the packet layout changes.
+// Telemetry (5 bytes in v1): [min, sec, running, period, battery%]
+// v2 adds:                    [flags, protocolVersion]  (7 bytes)
+#define PROTOCOL_VERSION 2
+#define FLAG_LOW_BATTERY    0x01  // battery below 15%
+#define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
+#define PANEL_LABEL_MAX 13        // 80px panel / 6px per character
 
 // Core Board Counters
 int homeScore = 0, awayScore = 0, period = 1, totalPeriods = 4, brightness = 40;
 int timerMin = 10, timerSec = 0, batteryPct = 100;
 bool isTimerRunning = false;
+bool hasReceivedState = false;  // false until the phone sends its first state packet this session
 
 enum BLEState { SEARCHING_NEW, RETRYING_PAST, LINKED_CONNECTED };
 BLEState currentBLEState = SEARCHING_NEW;
@@ -64,6 +81,8 @@ String deviceBroadcastName = "Scoreboard_Beta";
 
 BLEServer *pServer = nullptr;
 BLECharacteristic *pChar = nullptr;
+BLECharacteristic *pConfigChar = nullptr;
+String pendingDeviceName = "";
 
 int readBatteryPercentage() {
   long rawSum = 0;
@@ -99,14 +118,15 @@ void drawScoreboard() {
   } else {
     dma_display->setTextColor(dma_display->color565(255, 120, 0)); 
   }
+  dma_display->setTextWrap(false);
   dma_display->setCursor(2, 30);
-  dma_display->print(bottomClockString);
+  dma_display->print(bottomClockString.substring(0, PANEL_LABEL_MAX));
 }
 
 class ScoreboardServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) { currentBLEState = LINKED_CONNECTED; statusLED.setPixelColor(0, statusLED.Color(0, 150, 0)); statusLED.show(); }
     void onDisconnect(BLEServer* pServer) {
-        if (homeScore == 0 && awayScore == 0 && period == 1 && homeName == "HOME") { currentBLEState = SEARCHING_NEW; } 
+        if (!hasReceivedState) { currentBLEState = SEARCHING_NEW; } 
         else { currentBLEState = RETRYING_PAST; stateTransitionMillis = millis(); }
         statusLED.setPixelColor(0, statusLED.Color(0, 0, 0)); statusLED.show();
         delay(200); pServer->startAdvertising();
@@ -120,10 +140,11 @@ class FullControlCallbacks: public BLECharacteristicCallbacks {
         
         if (dataLength >= 8) { 
             // FIXED: Added precise index tracking matrix brackets to extract individual bytes
+            hasReceivedState = true;
             homeScore      = rawData[0];
             awayScore      = rawData[1];
             period         = rawData[2];
-            brightness     = rawData[3];
+            brightness     = constrain(rawData[3], 10, 120); // same range as the app's slider
             timerMin       = rawData[4];
             timerSec       = rawData[5];
             isTimerRunning = (rawData[6] == 1);
@@ -143,16 +164,50 @@ class FullControlCallbacks: public BLECharacteristicCallbacks {
                     awayName = payload.substring(pipe1 + 1, pipe2).substring(0, 4);
                     if (pipe3 != -1) {
                         periodRatio = payload.substring(pipe2 + 1, pipe3).substring(0, 3);
-                        String incomingDeviceName = payload.substring(pipe3 + 1);
-                        if (incomingDeviceName.length() > 0 && incomingDeviceName != deviceBroadcastName) {
-                            deviceBroadcastName = incomingDeviceName;
-                            prefs.begin("scoreboard", false); prefs.putString("devName", deviceBroadcastName); prefs.end();
-                            delay(500); esp_restart(); 
-                        }
+                        // Field 4 is the bottom-line label (e.g. "1st Period 10:00"), never a device name.
+                        bottomClockString = payload.substring(pipe3 + 1).substring(0, 31);
                     } else { periodRatio = payload.substring(pipe2 + 1); }
                 }
             }
             drawScoreboard();
+        }
+    }
+};
+
+class ConfigCallbacks: public BLECharacteristicCallbacks {
+    void reply(uint8_t cmd, uint8_t status) {
+        uint8_t resp[2] = { cmd, status };
+        pConfigChar->setValue(resp, 2);
+        pConfigChar->notify();
+    }
+
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        uint8_t* data = pCharacteristic->getData();
+        size_t len = pCharacteristic->getLength();
+        if (len < 1) return;
+
+        switch (data[0]) {
+            case CMD_SET_NAME: {
+                size_t nameLen = len - 1;
+                bool valid = nameLen >= 1 && nameLen <= DEVICE_NAME_MAX;
+                for (size_t i = 1; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E); }
+                if (!valid) { reply(CMD_SET_NAME, CFG_BAD_ARG); return; }
+                pendingDeviceName = "";
+                for (size_t i = 1; i < len; i++) { pendingDeviceName += (char)data[i]; }
+                reply(CMD_SET_NAME, CFG_OK);
+                break;
+            }
+            case CMD_APPLY: {
+                if (pendingDeviceName.length() == 0) { reply(CMD_APPLY, CFG_NOTHING_STAGED); return; }
+                deviceBroadcastName = pendingDeviceName;
+                pendingDeviceName = "";
+                prefs.begin("scoreboard", false); prefs.putString("devName", deviceBroadcastName); prefs.end();
+                reply(CMD_APPLY, CFG_OK);
+                delay(500); esp_restart();
+                break;
+            }
+            default:
+                reply(data[0], CFG_BAD_ARG);
         }
     }
 };
@@ -180,16 +235,32 @@ void setup() {
 
   // 📡 SILENT BACKGROUND WI-FI OTA INITIALIZATION
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  WiFi.setAutoReconnect(true);
+  WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+      Serial.printf("[wifi] connected, IP %s, RSSI %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      Serial.printf("[wifi] disconnected, reason %d\n", info.wifi_sta_disconnected.reason);
+    }
+  });
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.println("[wifi] connecting...");
   
   // Set up local Arduino OTA network port name
+  // Hostnames may only contain letters, digits and "-": "Scoreboard_Beta" becomes "Scoreboard-Beta".
+  String otaHost = deviceBroadcastName;
+  for (size_t i = 0; i < otaHost.length(); i++) {
+    char c = otaHost[i];
+    if (!isalnum((unsigned char)c) && c != '-') otaHost.setCharAt(i, '-');
+  }
   char otaNameBuffer[32];
-  deviceBroadcastName.toCharArray(otaNameBuffer, 32);
+  otaHost.toCharArray(otaNameBuffer, 32);
   ArduinoOTA.setHostname(otaNameBuffer);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
 
   ArduinoOTA.onStart([]() { Serial.println("Wireless flashing started..."); });
   ArduinoOTA.onEnd([]() { Serial.println("\nWireless flash complete! Rebooting..."); });
-  ArduinoOTA.begin();
+  // ArduinoOTA.begin() (and its mDNS announcement) is called from loop() once Wi-Fi has an IP.
 
   // Bluetooth configuration setup
   char nameBuffer[32];
@@ -205,7 +276,13 @@ void setup() {
                         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
                       );
 
-  pChar->setCallbacks(new FullControlCallbacks()); 
+  pChar->setCallbacks(new FullControlCallbacks());
+
+  pConfigChar = pService->createCharacteristic(
+                        CONFIG_UUID,
+                        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+                      );
+  pConfigChar->setCallbacks(new ConfigCallbacks());
   pService->start();
   
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
@@ -220,7 +297,20 @@ void loop() {
   unsigned long currentMillis = millis();
 
   // Handle background wireless Arduino IDE port listening check requests
-  ArduinoOTA.handle();
+  static unsigned long lastWifiLogMillis = 0;
+  if (currentMillis - lastWifiLogMillis >= 10000) {
+    lastWifiLogMillis = currentMillis;
+    // status: 3 = connected, 1 = network not found (not visible on 2.4 GHz?), 4 = connect failed (wrong password?), 6 = disconnected
+    Serial.printf("[wifi] status %d, IP %s, ble %s\n", WiFi.status(), WiFi.localIP().toString().c_str(),
+                  currentBLEState == LINKED_CONNECTED ? "linked" : "waiting");
+  }
+  static bool otaStarted = false;
+  if (!otaStarted && WiFi.status() == WL_CONNECTED) {
+    ArduinoOTA.begin();
+    otaStarted = true;
+    Serial.printf("[ota] ready as %s.local\n", ArduinoOTA.getHostname().c_str());
+  }
+  if (otaStarted) ArduinoOTA.handle();
 
   static unsigned long lastNotifyMillis = 0;
   if (currentBLEState == LINKED_CONNECTED && currentMillis - lastNotifyMillis >= 2000) {
@@ -228,8 +318,9 @@ void loop() {
      batteryPct = readBatteryPercentage();
      
      // FIXED: Added array assignment tracking brackets to structure multi-byte list payloads
-     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct };
-     pChar->setValue(telemetryPacket, 5); pChar->notify();
+     uint8_t flags = (batteryPct < 15 ? FLAG_LOW_BATTERY : 0) | (pendingDeviceName.length() > 0 ? FLAG_RENAME_STAGED : 0);
+     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct, flags, PROTOCOL_VERSION };
+     pChar->setValue(telemetryPacket, sizeof(telemetryPacket)); pChar->notify();
   }
 
   if (currentMillis - lastBlinkMillis >= 400) {
@@ -243,6 +334,7 @@ void loop() {
       statusLED.setPixelColor(0, blinkToggleState ? statusLED.Color(0, 150, 200) : statusLED.Color(0, 0, 0)); statusLED.show();
       if (currentMillis - stateTransitionMillis >= 30000) {
         currentBLEState = SEARCHING_NEW;
+        hasReceivedState = false;
         homeScore = 0; awayScore = 0; period = 1; homeName = "HOME"; awayName = "AWAY"; periodRatio = "1/4"; bottomClockString = "00:00";
         drawScoreboard();
       }
