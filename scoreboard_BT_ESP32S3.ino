@@ -235,17 +235,32 @@ void setup() {
 
   // 📡 SILENT BACKGROUND WI-FI OTA INITIALIZATION
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+      Serial.printf("[wifi] connected, IP %s, RSSI %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      Serial.printf("[wifi] disconnected, reason %d\n", info.wifi_sta_disconnected.reason);
+    }
+  });
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.println("[wifi] connecting...");
   
   // Set up local Arduino OTA network port name
+  // Hostnames may only contain letters, digits and "-": "Scoreboard_Beta" becomes "Scoreboard-Beta".
+  String otaHost = deviceBroadcastName;
+  for (size_t i = 0; i < otaHost.length(); i++) {
+    char c = otaHost[i];
+    if (!isalnum((unsigned char)c) && c != '-') otaHost.setCharAt(i, '-');
+  }
   char otaNameBuffer[32];
-  deviceBroadcastName.toCharArray(otaNameBuffer, 32);
+  otaHost.toCharArray(otaNameBuffer, 32);
   ArduinoOTA.setHostname(otaNameBuffer);
   ArduinoOTA.setPassword(OTA_PASSWORD);
 
   ArduinoOTA.onStart([]() { Serial.println("Wireless flashing started..."); });
   ArduinoOTA.onEnd([]() { Serial.println("\nWireless flash complete! Rebooting..."); });
-  ArduinoOTA.begin();
+  // ArduinoOTA.begin() (and its mDNS announcement) is called from loop() once Wi-Fi has an IP.
 
   // Bluetooth configuration setup
   char nameBuffer[32];
@@ -282,7 +297,20 @@ void loop() {
   unsigned long currentMillis = millis();
 
   // Handle background wireless Arduino IDE port listening check requests
-  ArduinoOTA.handle();
+  static unsigned long lastWifiLogMillis = 0;
+  if (currentMillis - lastWifiLogMillis >= 10000) {
+    lastWifiLogMillis = currentMillis;
+    // status: 3 = connected, 1 = network not found (not visible on 2.4 GHz?), 4 = connect failed (wrong password?), 6 = disconnected
+    Serial.printf("[wifi] status %d, IP %s, ble %s\n", WiFi.status(), WiFi.localIP().toString().c_str(),
+                  currentBLEState == LINKED_CONNECTED ? "linked" : "waiting");
+  }
+  static bool otaStarted = false;
+  if (!otaStarted && WiFi.status() == WL_CONNECTED) {
+    ArduinoOTA.begin();
+    otaStarted = true;
+    Serial.printf("[ota] ready as %s.local\n", ArduinoOTA.getHostname().c_str());
+  }
+  if (otaStarted) ArduinoOTA.handle();
 
   static unsigned long lastNotifyMillis = 0;
   if (currentBLEState == LINKED_CONNECTED && currentMillis - lastNotifyMillis >= 2000) {
