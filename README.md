@@ -162,3 +162,43 @@ After the first state packet of a session, an unexpected disconnect starts a 30 
        HUB75 GND pin or the screen graphics will render as scrolling noise!
 
 ///
+
+## 🔋 Battery Sizing
+
+> These figures are estimates for an 80x40 P4 panel running at the app's brightness limit. Measure your own build (see below) before buying a pack.
+
+### How much power does it use?
+
+| Part | Typical draw at 5 V |
+| :--- | :--- |
+| P4 80x40 panel (mostly dark, text only, brightness capped at 120/255) | 0.8 - 1.5 A |
+| ESP32-S3 with Bluetooth and Wi-Fi | 0.1 - 0.2 A |
+
+The boost converters lose about 15%, so the battery supplies roughly **5 - 9 W**, or about **1.4 - 2.5 A at 3.7 V**. Bright, full-white content draws more.
+
+### Recommended pack
+
+A **single-cell 3.7 V pack of 8,000 - 10,000 mAh with a protection circuit** covers a full day of games with breaks and setup time. Three protected 18650 cells in parallel (about 9,000 mAh) work well. 5,000 mAh is the minimum if you run only one or two games per charge.
+
+| Pack | Approximate runtime |
+| :--- | :--- |
+| 5,000 mAh | 1.7 - 3 h |
+| 8,000 mAh | 2.8 - 5 h |
+| 10,000 mAh | 3.5 - 6 h |
+
+Runtimes assume 85% of the rated capacity is usable and a 5 - 9 W draw.
+
+### Measure it yourself
+
+Run a normal game at your usual brightness for about 10 minutes and read the average current from the round volt/amp gauge. Then:
+
+```
+capacity needed (Ah) = average current (A) x hours wanted / 0.8
+```
+
+### Things to watch
+
+- **Use a protected pack** (or a BMS) and put a fuse close to the battery. Do not use bare, unprotected LiPo cells.
+- **Charging is slow.** The TP4056 charges at 1 A at most, so a 10 Ah pack needs 10 hours or more. For packs above about 6 Ah, consider a faster charger.
+- **The XL6009 that feeds the panel** is rated for 4 A of switch current. At 3.7 V in, a 1.5 A panel load already needs about 2.4 A from the battery, so expect it to get warm and check that the panel does not spike above that at full white.
+- **The battery percentage is approximate.** The firmware scales 3.4 V (0%) to 4.2 V (100%) in a straight line, while a real LiPo discharge curve is not linear. Use it as a rough gauge, not a fuel meter.
