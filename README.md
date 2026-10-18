@@ -6,6 +6,8 @@ This repository contains the resilient, optimized C++ firmware required to trans
 
 - **Pure Display Slave Architecture:** All complex string formatting, language localizations, and clock cycles are handled by the paired iPhone application. The chip extracts layout control bytes and instantly draws what the app transmits, preventing processing lag.
 - **Persistent Naming & Renaming:** Allows users to name their board dynamically from the smartphone remote (e.g., *"Juan's Board"*). The string is saved securely to non-volatile internal flash memory using the `Preferences` library and automatically updates the BLE broadcast identity profile.
+- **Configurable Colors:** The phone app sets the color of the timer (running and stopped), the period, each team's name and score, and the two start alerts. The board saves them in flash (`CMD_SET_COLORS`), so they survive reboots.
+- **Start Alerts:** When the app starts a game or period it sends `CMD_ALERT`: the border flashes and the message scrolls across the whole panel at 3x in the alert's color, then the scoreboard returns.
 - **Smart Connection Recovery & Timeout:** 
   - *Searching:* Onboard RGB NeoPixel blinks **Solid Blue**.
   - *Connected:* Transitions cleanly to **Solid Green**.
@@ -85,7 +87,20 @@ One service, two characteristics. Keep these tables in sync with `AdvancedBLEMan
 | 7 | Total periods | |
 | 8+ | Text (optional) | ASCII `home\|away\|ratio\|bottomLabel` |
 
-Names are cut to 4 characters, the ratio to 3, and the bottom label to 13 (the width of the panel). The text must be plain ASCII because the panel font has no accents; the app strips them. Writes shorter than 8 bytes are ignored.
+Panel layout (80 x 40, no frame, 3x5 pixel font, capital letters only):
+
+| Area | What is drawn |
+| :--- | :--- |
+| Top left | Timer `MM:SS` at 2x, green while running and orange when stopped |
+| Top right | Period tracker `period/total` at 2x, yellow |
+| Middle | Scores at 3x (9 x 15 px per digit), centered under each team |
+| Bottom | Team names at 2x (6 x 10 px per letter), blue for home and red for away |
+
+Panel behavior:
+- **Team names** are kept up to 20 characters and shown in capitals. Each name has half the panel (36 px). A name of up to 4 letters is centered; a longer one scrolls from right to left like a marquee, pausing briefly at the start of each pass.
+- **Timer and period** are drawn from the header bytes (minutes, seconds, running flag, period, total periods), not from the text, so they always show even if the text is cut. The ratio and label fields of the text are still sent for older firmware but ignored.
+- **The board counts its own seconds** while the clock runs and resyncs on every write, so the clock keeps moving if the phone link drops. After 30 seconds without a phone it resets to `10:00`.
+- The text must be plain ASCII because the panel font has no accents; the app strips them. Writes shorter than 8 bytes are ignored. The board asks for a 185 byte MTU so names fit in one write; at the default MTU of 23 a write would be cut at 20 bytes.
 
 ### Telemetry: board → phone (notify every 2 s while connected)
 
@@ -97,7 +112,7 @@ Names are cut to 4 characters, the ratio to 3, and the bottom label to 13 (the w
 | 3 | Period | |
 | 4 | Battery % | 0-100 |
 | 5 | Flags | bit 0 = battery below 15%, bit 1 = a new name is staged |
-| 6 | Protocol version | currently `2`; bytes 5-6 are absent on version 1 firmware |
+| 6 | Protocol version | currently `3` (colors); bytes 5-6 are absent on version 1 firmware |
 
 The app shows "firmware outdated" when it receives a shorter packet or a lower version than it expects. Bump `PROTOCOL_VERSION` in the sketch and `expectedProtocolVersion` in the app together whenever a layout changes.
 
@@ -109,6 +124,8 @@ Write `[command, args...]` to the config characteristic; each command is answere
 | :--- | :--- | :--- |
 | `0x01` Set name | `01` + 1-20 printable ASCII bytes | Stages the name; nothing is saved yet |
 | `0x02` Apply | `02` | Saves the staged name to flash and reboots |
+| `0x03` Set colors | `03` + 9 x RGB565 (2 bytes each, big-endian) | Sets the color of each piece of panel text and saves them to flash. Order: timer running, timer stopped, period, home name, home score, away name, away score, game start alert, period start alert |
+| `0x04` Alert | `04`, type (`1` game start, `2` period start), 1-16 ASCII characters | Plays the alert: the text scrolls across the whole panel at 3x in the alert's color while the border flashes, then the scoreboard returns |
 
 ### Connection states
 After the first state packet of a session, an unexpected disconnect starts a 30 second cyan "retrying" window for the same phone. If no state was received yet, or the window expires, the board returns to blue "searching" and resets the display.
