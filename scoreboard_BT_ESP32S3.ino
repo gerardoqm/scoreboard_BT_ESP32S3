@@ -7,6 +7,9 @@
 #include <Adafruit_NeoPixel.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h> 
+#include <Update.h>
+#include <esp_random.h>
+#include "mbedtls/md.h"
 
 #define PANEL_RES_X 80
 #define PANEL_RES_Y 40
@@ -50,6 +53,28 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 #define CMD_SET_COLORS 0x03 // args: 9 x RGB565 big-endian, in the PanelColor order below; saved to flash
 #define CMD_ALERT      0x04 // args: type (1 = game start, 2 = period start) + 1-16 ASCII characters to scroll
 #define CMD_SET_VISIBILITY 0x05 // args: 2 bytes, little-endian bitmask, bit i set = PanelColor i is shown; saved to flash
+// Firmware update over Bluetooth: own characteristic. Phone -> board writes start with an opcode; replies are
+// notifications [opcode, status, ...]. Data chunks are written without response and acknowledged every 4 KB.
+#define OTA_UUID           "87654321-4321-4321-4321-210987654323"
+#define OTA_OP_BEGIN       0x01   // -> notify [01, status, 16-byte random nonce]
+#define OTA_OP_AUTH        0x02   // [02] + HMAC-SHA256(OTA_PASSWORD, nonce) (32 bytes) -> notify [02, status]
+#define OTA_OP_START       0x03   // [03] + size (u32 LE) + CRC-32 (u32 LE) -> notify [03, status] once flash is ready
+#define OTA_OP_DATA        0x04   // [04] + up to 180 bytes of the image, no response
+#define OTA_OP_ACK         0x05   // notify only: [05] + bytes written to flash (u32 LE)
+#define OTA_OP_END         0x06   // [06] -> verifies the CRC, switches to the new image, reboots; notify [06, status] first
+#define OTA_OP_ABORT       0x07
+#define OTA_OK             0x00
+#define OTA_ERR_ARG        0x01
+#define OTA_ERR_STATE      0x02
+#define OTA_ERR_AUTH       0x03
+#define OTA_ERR_SIZE       0x04
+#define OTA_ERR_WRITE      0x05
+#define OTA_ERR_CRC        0x06
+#define OTA_ERR_LOCKED     0x07
+#define OTA_ERR_TIMEOUT    0x08
+#define OTA_RING_SIZE      16384
+#define OTA_ACK_EVERY      4096
+#define OTA_IDLE_TIMEOUT_MS 20000
 #define ALERT_TEXT_MAX 16
 #define ALERT_MS_PER_PX 18   // scroll speed of the alert text (about 55 px/s)
 #define ALERT_FLASH_MS 250   // the border flashes at 2 Hz
@@ -64,7 +89,9 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // v2 adds:                    [flags, protocolVersion]  (7 bytes)
 // v3 adds the CMD_SET_COLORS and CMD_ALERT config commands (panel text colors, start-of-game/period alerts).
 // v4 adds CMD_SET_VISIBILITY (hide or show each element of the panel).
-#define PROTOCOL_VERSION 4
+// v5 adds firmware updates over Bluetooth (OTA characteristic) and the build number as byte 7 of the telemetry (8 bytes).
+#define PROTOCOL_VERSION 5
+#define FW_BUILD 1   // bump with every firmware release; sent in the telemetry so the app can compare it with its bundled image
 #define FLAG_LOW_BATTERY    0x01  // battery below 15%
 #define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
 
@@ -117,6 +144,17 @@ volatile bool sceneDirty = true;     // something changed and the panel needs a 
 unsigned long lastTickMillis = 0;    // phase of the board's own 1 s clock tick
 unsigned long lastMarqueeStep = 0;
 
+enum FwuState { FWU_IDLE, FWU_AUTH_PENDING, FWU_READY, FWU_STARTING, FWU_RECEIVING };
+volatile FwuState otaState = FWU_IDLE;
+BLECharacteristic *pOtaChar = nullptr;
+uint8_t otaNonce[16];
+uint32_t otaSize = 0, otaExpectedCrc = 0, otaCrc = 0xFFFFFFFF, otaWritten = 0, otaLastAck = 0;
+uint8_t otaRing[OTA_RING_SIZE];
+volatile uint32_t otaHead = 0, otaTail = 0;     // running byte counters; the BLE task fills, loop() drains
+volatile bool otaEndRequested = false, otaAbortRequested = false, otaOverflow = false;
+uint8_t otaAuthFailures = 0;
+unsigned long otaLockedUntil = 0, otaLastActivity = 0, lastOtaDraw = 0;
+
 GFXcanvas16 *frame = nullptr;        // off-screen copy of the whole panel, copied over in one go (no flicker)
 GFXcanvas16 *slotCanvas = nullptr;   // clips a scrolling name to its slot
 
@@ -168,6 +206,7 @@ static const Glyph GLYPHS[] = {
   {'Y', 3, {0x5,0x5,0x2,0x2,0x2}},
   {'Z', 3, {0x7,0x1,0x2,0x4,0x7}},
   {'/', 3, {0x1,0x1,0x2,0x4,0x4}},
+  {'%', 3, {0x5,0x1,0x2,0x4,0x5}},
   {':', 1, {0x0,0x1,0x0,0x1,0x0}},
   {' ', 2, {0x0,0x0,0x0,0x0,0x0}},
   {'-', 3, {0x0,0x0,0x7,0x0,0x0}},
@@ -299,9 +338,23 @@ void drawScoreboard() {
   dma_display->drawRGBBitmap(0, 0, frame->getBuffer(), PANEL_RES_X, PANEL_RES_Y);
 }
 
+// Progress screen shown while a firmware update runs. Call with stateMutex held.
+void drawOtaScreen() {
+  frame->fillScreen(0);
+  String title = "UPDATING";
+  drawText(frame, (PANEL_RES_X - textUnits(title) * 2) / 2, 4, title, c565(255, 200, 0), 2);
+  uint32_t percent = otaSize ? (uint32_t)((uint64_t)otaWritten * 100 / otaSize) : 0;
+  frame->drawRect(5, 20, 70, 10, c565(80, 80, 80));
+  frame->fillRect(6, 21, (int)(68 * percent / 100), 8, c565(0, 255, 0));
+  String label = String(percent) + "%";
+  drawText(frame, (PANEL_RES_X - textUnits(label)) / 2, 33, label, c565(255, 255, 255), 1);
+  dma_display->drawRGBBitmap(0, 0, frame->getBuffer(), PANEL_RES_X, PANEL_RES_Y);
+}
+
 class ScoreboardServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) { currentBLEState = LINKED_CONNECTED; statusLED.setPixelColor(0, statusLED.Color(0, 150, 0)); statusLED.show(); }
     void onDisconnect(BLEServer* pServer) {
+        if (otaState != FWU_IDLE) otaAbortRequested = true;     // the phone vanished mid-update
         if (!hasReceivedState) { currentBLEState = SEARCHING_NEW; } 
         else { currentBLEState = RETRYING_PAST; stateTransitionMillis = millis(); }
         statusLED.setPixelColor(0, statusLED.Color(0, 0, 0)); statusLED.show();
@@ -426,6 +479,160 @@ class ConfigCallbacks: public BLECharacteristicCallbacks {
     }
 };
 
+// ---------------------------------------------------------------------------------------------
+// Firmware update over Bluetooth. The phone proves it knows OTA_PASSWORD (HMAC over a random nonce), then
+// streams the image; chunks wait in a ring buffer so the BLE task never blocks on flash. loop() writes them
+// to the spare firmware slot, checks the CRC-32 and only then switches to the new image.
+// ---------------------------------------------------------------------------------------------
+
+// Standard CRC-32 (the same one zlib uses); start from 0xFFFFFFFF and invert at the end.
+static uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; b++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+  }
+  return crc;
+}
+
+static void otaNotifyData(uint8_t op, uint8_t status, const uint8_t *extra, size_t extraLen) {
+  uint8_t buf[20];
+  buf[0] = op; buf[1] = status;
+  if (extra == nullptr || extraLen > sizeof(buf) - 2) extraLen = 0; else memcpy(buf + 2, extra, extraLen);
+  pOtaChar->setValue(buf, 2 + extraLen);
+  pOtaChar->notify();
+}
+
+// Gives up on the current update: discards what was written, tells the phone why, and returns to the scoreboard.
+static void otaFail(uint8_t op, uint8_t status) {
+  if (otaState == FWU_STARTING || otaState == FWU_RECEIVING) Update.abort();
+  otaState = FWU_IDLE;
+  otaEndRequested = false; otaAbortRequested = false; otaOverflow = false;
+  otaHead = otaTail = 0;
+  otaNotifyData(op, status, nullptr, 0);
+  sceneDirty = true;
+}
+
+class OtaCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        uint8_t *d = pCharacteristic->getData();
+        size_t len = pCharacteristic->getLength();
+        if (len < 1) return;
+        otaLastActivity = millis();
+
+        switch (d[0]) {
+            case OTA_OP_BEGIN: {
+                if (otaState == FWU_STARTING || otaState == FWU_RECEIVING) { otaNotifyData(OTA_OP_BEGIN, OTA_ERR_STATE, nullptr, 0); return; }
+                if (millis() < otaLockedUntil) { otaNotifyData(OTA_OP_BEGIN, OTA_ERR_LOCKED, nullptr, 0); return; }
+                esp_fill_random(otaNonce, sizeof(otaNonce));
+                otaState = FWU_AUTH_PENDING;
+                otaNotifyData(OTA_OP_BEGIN, OTA_OK, otaNonce, sizeof(otaNonce));
+                break;
+            }
+            case OTA_OP_AUTH: {
+                if (otaState != FWU_AUTH_PENDING || len != 33) { otaNotifyData(OTA_OP_AUTH, OTA_ERR_STATE, nullptr, 0); return; }
+                uint8_t mac[32];
+                const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+                mbedtls_md_hmac(info, (const unsigned char *)OTA_PASSWORD, strlen(OTA_PASSWORD), otaNonce, sizeof(otaNonce), mac);
+                uint8_t diff = 0;
+                for (int i = 0; i < 32; i++) diff |= mac[i] ^ d[1 + i];     // constant time
+                if (diff == 0) {
+                    otaState = FWU_READY; otaAuthFailures = 0;
+                    otaNotifyData(OTA_OP_AUTH, OTA_OK, nullptr, 0);
+                } else {
+                    otaState = FWU_IDLE;
+                    if (++otaAuthFailures >= 3) { otaLockedUntil = millis() + 30000; otaAuthFailures = 0; }   // 3 wrong tries: locked for 30 s
+                    otaNotifyData(OTA_OP_AUTH, OTA_ERR_AUTH, nullptr, 0);
+                }
+                break;
+            }
+            case OTA_OP_START: {
+                if (otaState != FWU_READY || len != 9) { otaNotifyData(OTA_OP_START, OTA_ERR_STATE, nullptr, 0); return; }
+                uint32_t size = (uint32_t)d[1] | ((uint32_t)d[2] << 8) | ((uint32_t)d[3] << 16) | ((uint32_t)d[4] << 24);
+                uint32_t crc  = (uint32_t)d[5] | ((uint32_t)d[6] << 8) | ((uint32_t)d[7] << 16) | ((uint32_t)d[8] << 24);
+                if (size < 65536 || size > ESP.getFreeSketchSpace()) { otaNotifyData(OTA_OP_START, OTA_ERR_SIZE, nullptr, 0); return; }
+                otaSize = size; otaExpectedCrc = crc; otaCrc = 0xFFFFFFFF; otaWritten = 0; otaLastAck = 0;
+                otaHead = otaTail = 0; otaEndRequested = false; otaAbortRequested = false; otaOverflow = false;
+                otaState = FWU_STARTING;       // loop() erases the slot (slow) and then confirms with a START notification
+                break;
+            }
+            case OTA_OP_DATA: {
+                if (otaState != FWU_RECEIVING) return;
+                size_t n = len - 1;
+                uint32_t used = otaHead - otaTail;
+                if (n > OTA_RING_SIZE - used) { otaOverflow = true; return; }
+                for (size_t i = 0; i < n; i++) otaRing[(otaHead + i) % OTA_RING_SIZE] = d[1 + i];
+                __sync_synchronize();
+                otaHead = otaHead + n;
+                break;
+            }
+            case OTA_OP_END:
+                if (otaState == FWU_RECEIVING) otaEndRequested = true; else otaNotifyData(OTA_OP_END, OTA_ERR_STATE, nullptr, 0);
+                break;
+            case OTA_OP_ABORT:
+                otaAbortRequested = true;
+                break;
+        }
+    }
+};
+
+// Called from loop(): erases and writes flash, acknowledges progress, verifies and applies the finished image.
+static void otaService() {
+  if (otaState == FWU_IDLE) return;
+  unsigned long now = millis();
+
+  if (otaAbortRequested) {
+    if (otaState == FWU_STARTING || otaState == FWU_RECEIVING) Update.abort();
+    otaState = FWU_IDLE; otaAbortRequested = false; otaEndRequested = false; otaHead = otaTail = 0;
+    sceneDirty = true;
+    return;
+  }
+  if (now - otaLastActivity > OTA_IDLE_TIMEOUT_MS) { otaFail(OTA_OP_ABORT, OTA_ERR_TIMEOUT); return; }
+
+  if (otaState == FWU_STARTING) {
+    if (Update.begin(otaSize)) {
+      otaState = FWU_RECEIVING; otaLastActivity = millis();
+      otaNotifyData(OTA_OP_START, OTA_OK, nullptr, 0);
+    } else {
+      otaState = FWU_IDLE; sceneDirty = true;
+      otaNotifyData(OTA_OP_START, OTA_ERR_WRITE, nullptr, 0);
+    }
+    return;
+  }
+
+  if (otaState == FWU_RECEIVING) {
+    if (otaOverflow) { otaFail(OTA_OP_DATA, OTA_ERR_WRITE); return; }
+    uint32_t avail = otaHead - otaTail;
+    while (avail > 0) {
+      uint32_t idx = otaTail % OTA_RING_SIZE;
+      uint32_t n = min(avail, (uint32_t)(OTA_RING_SIZE - idx));
+      if (n > 2048) n = 2048;
+      if (Update.write(&otaRing[idx], n) != n) { otaFail(OTA_OP_DATA, OTA_ERR_WRITE); return; }
+      otaCrc = crc32Update(otaCrc, &otaRing[idx], n);
+      otaWritten += n;
+      __sync_synchronize();
+      otaTail = otaTail + n;
+      avail -= n;
+      otaLastActivity = millis();
+    }
+    if (otaWritten - otaLastAck >= OTA_ACK_EVERY || (otaWritten == otaSize && otaLastAck != otaWritten)) {
+      otaLastAck = otaWritten;
+      uint8_t ack[5] = { OTA_OP_ACK, (uint8_t)otaWritten, (uint8_t)(otaWritten >> 8), (uint8_t)(otaWritten >> 16), (uint8_t)(otaWritten >> 24) };
+      pOtaChar->setValue(ack, sizeof(ack));
+      pOtaChar->notify();
+    }
+    if (otaEndRequested && otaHead == otaTail) {
+      if (otaWritten != otaSize)              otaFail(OTA_OP_END, OTA_ERR_SIZE);
+      else if ((~otaCrc) != otaExpectedCrc)   otaFail(OTA_OP_END, OTA_ERR_CRC);
+      else if (!Update.end(true))             otaFail(OTA_OP_END, OTA_ERR_WRITE);
+      else {                                   // image is in place and verified: tell the phone, then boot into it
+        otaNotifyData(OTA_OP_END, OTA_OK, nullptr, 0);
+        delay(800);
+        ESP.restart();
+      }
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   analogSetAttenuation(ADC_11db); 
@@ -504,6 +711,12 @@ void setup() {
                         BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
                       );
   pConfigChar->setCallbacks(new ConfigCallbacks());
+
+  pOtaChar = pService->createCharacteristic(
+                        OTA_UUID,
+                        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY
+                      );
+  pOtaChar->setCallbacks(new OtaCallbacks());
   pService->start();
   
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
@@ -516,6 +729,8 @@ void setup() {
 
 void loop() {
   unsigned long currentMillis = millis();
+
+  otaService();   // firmware update over Bluetooth: flash writes happen here, outside the state mutex
 
   // Clock, scrolling names and redraw. The clock keeps counting here even if the phone link drops.
   xSemaphoreTake(stateMutex, portMAX_DELAY);
@@ -532,7 +747,9 @@ void loop() {
     bool movedHome = marqueeStep(homeMarquee), movedAway = marqueeStep(awayMarquee);
     if (movedHome || movedAway) sceneDirty = true;
   }
-  if (alertActive) {
+  if (otaState != FWU_IDLE) {
+    if (currentMillis - lastOtaDraw >= 150) { lastOtaDraw = currentMillis; drawOtaScreen(); }   // progress bar instead of the scoreboard
+  } else if (alertActive) {
     unsigned long elapsed = currentMillis - alertStartMillis;
     unsigned long total = (unsigned long)(PANEL_RES_X + textUnits(alertText) * 3) * ALERT_MS_PER_PX + ALERT_TAIL_MS;
     if (elapsed >= total) { alertActive = false; sceneDirty = true; }          // back to the scoreboard
@@ -563,7 +780,7 @@ void loop() {
      
      // FIXED: Added array assignment tracking brackets to structure multi-byte list payloads
      uint8_t flags = (batteryPct < 15 ? FLAG_LOW_BATTERY : 0) | (pendingDeviceName.length() > 0 ? FLAG_RENAME_STAGED : 0);
-     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct, flags, PROTOCOL_VERSION };
+     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct, flags, PROTOCOL_VERSION, FW_BUILD };
      pChar->setValue(telemetryPacket, sizeof(telemetryPacket)); pChar->notify();
   }
 
