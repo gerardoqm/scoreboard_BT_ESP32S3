@@ -47,6 +47,12 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 #define CONFIG_UUID         "87654321-4321-4321-4321-210987654322"
 #define CMD_SET_NAME 0x01   // args: 1-20 printable ASCII bytes; staged, not saved yet
 #define CMD_APPLY    0x02   // saves the staged name and reboots
+#define CMD_SET_COLORS 0x03 // args: 9 x RGB565 big-endian, in the PanelColor order below; saved to flash
+#define CMD_ALERT      0x04 // args: type (1 = game start, 2 = period start) + 1-16 ASCII characters to scroll
+#define ALERT_TEXT_MAX 16
+#define ALERT_MS_PER_PX 18   // scroll speed of the alert text (about 55 px/s)
+#define ALERT_FLASH_MS 250   // the border flashes at 2 Hz
+#define ALERT_TAIL_MS 400    // flashing continues briefly after the text has left
 #define CFG_OK       0x00
 #define CFG_BAD_ARG  0x01
 #define CFG_NOTHING_STAGED 0x02
@@ -55,10 +61,24 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // Protocol version reported in the telemetry notification. Bump when the packet layout changes.
 // Telemetry (5 bytes in v1): [min, sec, running, period, battery%]
 // v2 adds:                    [flags, protocolVersion]  (7 bytes)
-#define PROTOCOL_VERSION 2
+// v3 adds the CMD_SET_COLORS and CMD_ALERT config commands (panel text colors, start-of-game/period alerts).
+#define PROTOCOL_VERSION 3
 #define FLAG_LOW_BATTERY    0x01  // battery below 15%
 #define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
-#define PANEL_LABEL_MAX 13        // 80px panel / 6px per character
+
+// Panel layout (80x40), 3x5 pixel font: timer (left) and period (right) at 2x on top, scores at 3x in the
+// middle, team names at 2x along the bottom. No frame.
+#define NAME_MAX 20               // longest team name kept; names wider than the slot scroll
+#define NAME_SLOT_W 36            // pixels available for a name: half the panel, minus margins
+#define NAME_SLOT_H 10            // names are drawn at 2x the 3x5 font: 6 x 10 pixels per letter
+#define MARQUEE_STEP_MS 70        // scroll speed: about 14 px/s, right to left
+#define MARQUEE_GAP_PX 18         // blank space between the end of the name and its repeat
+#define MARQUEE_DWELL_MS 1500     // pause at the start so the name can be read
+
+// Text colors, in the order the app sends them (keep in sync with PanelElement in PanelColors.swift).
+enum PanelColor { COLOR_TIMER_RUNNING, COLOR_TIMER_STOPPED, COLOR_PERIOD, COLOR_HOME_NAME, COLOR_HOME_SCORE,
+                  COLOR_AWAY_NAME, COLOR_AWAY_SCORE, COLOR_ALERT_GAME, COLOR_ALERT_PERIOD, COLOR_COUNT };
+uint16_t panelColors[COLOR_COUNT];
 
 // Core Board Counters
 int homeScore = 0, awayScore = 0, period = 1, totalPeriods = 4, brightness = 40;
@@ -75,14 +95,123 @@ bool blinkToggleState = false;
 
 String homeName = "HOME";
 String awayName = "AWAY";
-String periodRatio = "1/4";
-String bottomClockString = "00:00";
 String deviceBroadcastName = "Scoreboard_Beta";
 
 BLEServer *pServer = nullptr;
 BLECharacteristic *pChar = nullptr;
 BLECharacteristic *pConfigChar = nullptr;
 String pendingDeviceName = "";
+
+// The BLE callbacks run on another task than loop(), so state and drawing share one mutex.
+SemaphoreHandle_t stateMutex = nullptr;
+// Start-of-game / start-of-period alert: text scrolls across the whole panel while the border flashes.
+bool alertActive = false;
+unsigned long alertStartMillis = 0, lastAlertDraw = 0;
+String alertText = "";
+uint16_t alertColor = 0;
+volatile bool sceneDirty = true;     // something changed and the panel needs a redraw
+unsigned long lastTickMillis = 0;    // phase of the board's own 1 s clock tick
+unsigned long lastMarqueeStep = 0;
+
+GFXcanvas16 *frame = nullptr;        // off-screen copy of the whole panel, copied over in one go (no flicker)
+GFXcanvas16 *slotCanvas = nullptr;   // clips a scrolling name to its slot
+
+// A team name that scrolls right to left when it is wider than its slot.
+struct Marquee {
+  String text;
+  int offset = 0;
+  unsigned long dwellUntil = 0;
+};
+Marquee homeMarquee, awayMarquee;
+
+// 3x5 pixel font: digits, A-Z, "/", ":", space and "-". Each row is 3 bits (bit 2 = leftmost pixel).
+struct Glyph { char ch; uint8_t w; uint8_t rows[5]; };
+static const Glyph GLYPHS[] = {
+  {'0', 3, {0x7,0x5,0x5,0x5,0x7}},
+  {'1', 3, {0x2,0x6,0x2,0x2,0x7}},
+  {'2', 3, {0x7,0x1,0x7,0x4,0x7}},
+  {'3', 3, {0x7,0x1,0x7,0x1,0x7}},
+  {'4', 3, {0x5,0x5,0x7,0x1,0x1}},
+  {'5', 3, {0x7,0x4,0x7,0x1,0x7}},
+  {'6', 3, {0x7,0x4,0x7,0x5,0x7}},
+  {'7', 3, {0x7,0x1,0x2,0x2,0x2}},
+  {'8', 3, {0x7,0x5,0x7,0x5,0x7}},
+  {'9', 3, {0x7,0x5,0x7,0x1,0x7}},
+  {'A', 3, {0x2,0x5,0x7,0x5,0x5}},
+  {'B', 3, {0x6,0x5,0x6,0x5,0x6}},
+  {'C', 3, {0x3,0x4,0x4,0x4,0x3}},
+  {'D', 3, {0x6,0x5,0x5,0x5,0x6}},
+  {'E', 3, {0x7,0x4,0x6,0x4,0x7}},
+  {'F', 3, {0x7,0x4,0x6,0x4,0x4}},
+  {'G', 3, {0x3,0x4,0x5,0x5,0x3}},
+  {'H', 3, {0x5,0x5,0x7,0x5,0x5}},
+  {'I', 3, {0x7,0x2,0x2,0x2,0x7}},
+  {'J', 3, {0x1,0x1,0x1,0x5,0x2}},
+  {'K', 3, {0x5,0x5,0x6,0x5,0x5}},
+  {'L', 3, {0x4,0x4,0x4,0x4,0x7}},
+  {'M', 3, {0x5,0x7,0x7,0x5,0x5}},
+  {'N', 3, {0x7,0x5,0x5,0x5,0x5}},
+  {'O', 3, {0x2,0x5,0x5,0x5,0x2}},
+  {'P', 3, {0x6,0x5,0x6,0x4,0x4}},
+  {'Q', 3, {0x2,0x5,0x5,0x6,0x3}},
+  {'R', 3, {0x6,0x5,0x6,0x5,0x5}},
+  {'S', 3, {0x3,0x4,0x2,0x1,0x6}},
+  {'T', 3, {0x7,0x2,0x2,0x2,0x2}},
+  {'U', 3, {0x5,0x5,0x5,0x5,0x7}},
+  {'V', 3, {0x5,0x5,0x5,0x5,0x2}},
+  {'W', 3, {0x5,0x5,0x7,0x7,0x5}},
+  {'X', 3, {0x5,0x5,0x2,0x5,0x5}},
+  {'Y', 3, {0x5,0x5,0x2,0x2,0x2}},
+  {'Z', 3, {0x7,0x1,0x2,0x4,0x7}},
+  {'/', 3, {0x1,0x1,0x2,0x4,0x4}},
+  {':', 1, {0x0,0x1,0x0,0x1,0x0}},
+  {' ', 2, {0x0,0x0,0x0,0x0,0x0}},
+  {'-', 3, {0x0,0x0,0x7,0x0,0x0}},
+};
+static const int GLYPH_COUNT = sizeof(GLYPHS) / sizeof(GLYPHS[0]);
+
+static const Glyph *glyphFor(char c) {
+  if (c >= 'a' && c <= 'z') c -= 32;               // the font has capitals only
+  for (int i = 0; i < GLYPH_COUNT; i++) if (GLYPHS[i].ch == c) return &GLYPHS[i];
+  return glyphFor('-');                            // anything else (accents are stripped by the app anyway)
+}
+
+// Width of a string in font pixels (1 pixel between letters).
+static int textUnits(const String &t) {
+  if (t.length() == 0) return 0;
+  int u = -1;
+  for (size_t i = 0; i < t.length(); i++) u += glyphFor(t[i])->w + 1;
+  return u;
+}
+
+// Draws text at pixel scale s. Drawing outside the canvas is clipped.
+static void drawText(GFXcanvas16 *cv, int x, int y, const String &t, uint16_t color, int s) {
+  for (size_t i = 0; i < t.length(); i++) {
+    const Glyph *g = glyphFor(t[i]);
+    for (int row = 0; row < 5; row++)
+      for (int col = 0; col < g->w; col++)
+        if (g->rows[row] & (1 << (g->w - 1 - col)))
+          for (int dx = 0; dx < s; dx++) for (int dy = 0; dy < s; dy++) cv->drawPixel(x + col * s + dx, y + row * s + dy, color);
+    x += (g->w + 1) * s;
+  }
+}
+
+
+static inline uint16_t c565(uint8_t r, uint8_t g, uint8_t b) { return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3); }
+
+void marqueeSet(Marquee &m, const String &text) {
+  if (m.text != text) { m.text = text; m.offset = 0; m.dwellUntil = millis() + MARQUEE_DWELL_MS; }
+}
+
+// Advances the scroll by one pixel. Returns true when the picture changed.
+bool marqueeStep(Marquee &m) {
+  int w = textUnits(m.text) * 2;
+  if (w <= NAME_SLOT_W) { m.offset = 0; return false; }
+  if (millis() < m.dwellUntil) return false;
+  m.offset++;
+  if (m.offset >= w + MARQUEE_GAP_PX) { m.offset = 0; m.dwellUntil = millis() + MARQUEE_DWELL_MS; }
+  return true;
+}
 
 int readBatteryPercentage() {
   long rawSum = 0;
@@ -93,34 +222,70 @@ int readBatteryPercentage() {
   return max(0, min(pct, 100));
 }
 
-void drawScoreboard() {
-  dma_display->fillScreen(dma_display->color565(0, 0, 0));
-  dma_display->drawRect(0, 0, 80, 40, dma_display->color565(0, 180, 0)); 
-  dma_display->drawFastVLine(40, 0, 26, dma_display->color565(40, 40, 40)); 
-  dma_display->setTextSize(1);
-  
-  dma_display->setTextColor(dma_display->color565(0, 120, 255));
-  dma_display->setCursor(3, 3); dma_display->print(homeName);
-  dma_display->setCursor(14, 14); dma_display->print(String(homeScore));
+// Defaults match the colors the panel used before they were configurable; saved colors replace them.
+void loadPanelColors() {
+  panelColors[COLOR_TIMER_RUNNING] = c565(0, 255, 0);
+  panelColors[COLOR_TIMER_STOPPED] = c565(255, 120, 0);
+  panelColors[COLOR_PERIOD]        = c565(255, 255, 0);
+  panelColors[COLOR_HOME_NAME]     = c565(0, 120, 255);
+  panelColors[COLOR_HOME_SCORE]    = c565(0, 120, 255);
+  panelColors[COLOR_AWAY_NAME]     = c565(255, 40, 40);
+  panelColors[COLOR_AWAY_SCORE]    = c565(255, 40, 40);
+  panelColors[COLOR_ALERT_GAME]    = c565(0, 255, 0);
+  panelColors[COLOR_ALERT_PERIOD]  = c565(0, 220, 255);
+  prefs.begin("scoreboard", true);
+  if (prefs.getBytesLength("colors") == sizeof(panelColors)) prefs.getBytes("colors", panelColors, sizeof(panelColors));
+  prefs.end();
+}
 
-  dma_display->setTextColor(dma_display->color565(255, 40, 40));
-  dma_display->setCursor(44, 3); dma_display->print(awayName);
-  dma_display->setCursor(55, 14); dma_display->print(String(awayScore));
-
-  dma_display->drawRect(31, 0, 19, 11, dma_display->color565(80, 80, 80));
-  dma_display->setTextColor(dma_display->color565(255, 255, 0)); 
-  dma_display->setCursor(33, 2); dma_display->print(periodRatio);
-
-  dma_display->drawFastHLine(0, 26, 80, dma_display->color565(80, 80, 80));
-
-  if (isTimerRunning) {
-    dma_display->setTextColor(dma_display->color565(0, 255, 0));   
-  } else {
-    dma_display->setTextColor(dma_display->color565(255, 120, 0)); 
+// One frame of the alert: flashing border plus the text scrolling right to left at 3x. Call with stateMutex held.
+void drawAlertFrame(unsigned long elapsed) {
+  frame->fillScreen(0);
+  if ((elapsed / ALERT_FLASH_MS) % 2 == 0) {
+    frame->drawRect(0, 0, PANEL_RES_X, PANEL_RES_Y, alertColor);
+    frame->drawRect(1, 1, PANEL_RES_X - 2, PANEL_RES_Y - 2, alertColor);
   }
-  dma_display->setTextWrap(false);
-  dma_display->setCursor(2, 30);
-  dma_display->print(bottomClockString.substring(0, PANEL_LABEL_MAX));
+  drawText(frame, PANEL_RES_X - (int)(elapsed / ALERT_MS_PER_PX), 12, alertText, alertColor, 3);
+  dma_display->drawRGBBitmap(0, 0, frame->getBuffer(), PANEL_RES_X, PANEL_RES_Y);
+}
+
+void drawName(Marquee &m, int slotX, uint16_t color) {
+  slotCanvas->fillScreen(0);
+  int w = textUnits(m.text) * 2;
+  if (w <= NAME_SLOT_W) {                       // fits: centered in the slot
+    drawText(slotCanvas, (NAME_SLOT_W - w) / 2, 0, m.text, color, 2);
+  } else {                                      // too wide: scroll, with a second copy trailing for a seamless loop
+    drawText(slotCanvas, -m.offset, 0, m.text, color, 2);
+    drawText(slotCanvas, -m.offset + w + MARQUEE_GAP_PX, 0, m.text, color, 2);
+  }
+  frame->drawRGBBitmap(slotX, 29, slotCanvas->getBuffer(), NAME_SLOT_W, NAME_SLOT_H);
+}
+
+void drawScore(int value, int centerX, uint16_t color) {
+  String text = String(value);
+  drawText(frame, centerX - textUnits(text) * 3 / 2, 13, text, color, 3);
+}
+
+// Draws the whole scoreboard off-screen, then copies it to the panel. Call with stateMutex held.
+void drawScoreboard() {
+  frame->fillScreen(0);
+
+  // top strip, from the header bytes (always delivered, unlike the optional text):
+  // timer on the left (green while running, orange when stopped), period on the right
+  char clock[6];
+  snprintf(clock, sizeof(clock), "%02d:%02d", timerMin, timerSec);
+  drawText(frame, 2, 1, String(clock), panelColors[isTimerRunning ? COLOR_TIMER_RUNNING : COLOR_TIMER_STOPPED], 2);
+  String periodText = String(period) + "/" + String(totalPeriods);
+  drawText(frame, 78 - textUnits(periodText) * 2, 1, periodText, panelColors[COLOR_PERIOD], 2);
+
+  frame->drawFastVLine(40, 12, 26, c565(40, 40, 40));   // between the two teams
+
+  drawScore(homeScore, 20, panelColors[COLOR_HOME_SCORE]);
+  drawScore(awayScore, 60, panelColors[COLOR_AWAY_SCORE]);
+  drawName(homeMarquee, 2, panelColors[COLOR_HOME_NAME]);
+  drawName(awayMarquee, 42, panelColors[COLOR_AWAY_NAME]);
+
+  dma_display->drawRGBBitmap(0, 0, frame->getBuffer(), PANEL_RES_X, PANEL_RES_Y);
 }
 
 class ScoreboardServerCallbacks: public BLEServerCallbacks {
@@ -138,38 +303,38 @@ class FullControlCallbacks: public BLECharacteristicCallbacks {
         uint8_t* rawData = pCharacteristic->getData();
         size_t dataLength = pCharacteristic->getLength();
         
-        if (dataLength >= 8) { 
-            // FIXED: Added precise index tracking matrix brackets to extract individual bytes
+        if (dataLength >= 8) {
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
             hasReceivedState = true;
             homeScore      = rawData[0];
             awayScore      = rawData[1];
             period         = rawData[2];
-            brightness     = constrain(rawData[3], 10, 120); // same range as the app's slider
+            brightness     = constrain(rawData[3], 10, 120); // same range as the app's stepper
             timerMin       = rawData[4];
             timerSec       = rawData[5];
             isTimerRunning = (rawData[6] == 1);
             totalPeriods   = rawData[7];
-            
+            lastTickMillis = millis();   // line the board's own seconds up with the phone's
+
             dma_display->setBrightness8(brightness);
 
+            // Optional text: "home|away|ratio|label". Only the names are used; the period box and the
+            // clock are drawn from the header bytes above, which fit in any BLE packet size.
             if (dataLength > 8) {
                 String payload = "";
                 for (size_t i = 8; i < dataLength; i++) { payload += (char)rawData[i]; }
                 int pipe1 = payload.indexOf('|');
-                int pipe2 = payload.indexOf('|', pipe1 + 1);
-                int pipe3 = payload.indexOf('|', pipe2 + 1);
-                
-                if (pipe1 != -1 && pipe2 != -1) {
-                    homeName = payload.substring(0, pipe1).substring(0, 4);
-                    awayName = payload.substring(pipe1 + 1, pipe2).substring(0, 4);
-                    if (pipe3 != -1) {
-                        periodRatio = payload.substring(pipe2 + 1, pipe3).substring(0, 3);
-                        // Field 4 is the bottom-line label (e.g. "1st Period 10:00"), never a device name.
-                        bottomClockString = payload.substring(pipe3 + 1).substring(0, 31);
-                    } else { periodRatio = payload.substring(pipe2 + 1); }
+                if (pipe1 != -1) {
+                    int pipe2 = payload.indexOf('|', pipe1 + 1);
+                    homeName = payload.substring(0, pipe1).substring(0, NAME_MAX);
+                    awayName = (pipe2 != -1 ? payload.substring(pipe1 + 1, pipe2) : payload.substring(pipe1 + 1)).substring(0, NAME_MAX);
+                    homeName.toUpperCase(); awayName.toUpperCase();
                 }
             }
-            drawScoreboard();
+            marqueeSet(homeMarquee, homeName);
+            marqueeSet(awayMarquee, awayName);
+            sceneDirty = true;
+            xSemaphoreGive(stateMutex);
         }
     }
 };
@@ -195,6 +360,32 @@ class ConfigCallbacks: public BLECharacteristicCallbacks {
                 pendingDeviceName = "";
                 for (size_t i = 1; i < len; i++) { pendingDeviceName += (char)data[i]; }
                 reply(CMD_SET_NAME, CFG_OK);
+                break;
+            }
+            case CMD_SET_COLORS: {
+                if (len != 1 + COLOR_COUNT * 2) { reply(CMD_SET_COLORS, CFG_BAD_ARG); return; }
+                xSemaphoreTake(stateMutex, portMAX_DELAY);
+                for (int i = 0; i < COLOR_COUNT; i++) panelColors[i] = ((uint16_t)data[1 + i * 2] << 8) | data[2 + i * 2];
+                sceneDirty = true;
+                xSemaphoreGive(stateMutex);
+                prefs.begin("scoreboard", false); prefs.putBytes("colors", panelColors, sizeof(panelColors)); prefs.end();
+                reply(CMD_SET_COLORS, CFG_OK);
+                break;
+            }
+            case CMD_ALERT: {
+                size_t textLen = len - 2;
+                bool valid = len >= 3 && textLen <= ALERT_TEXT_MAX && (data[1] == 1 || data[1] == 2);
+                for (size_t i = 2; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E); }
+                if (!valid) { reply(CMD_ALERT, CFG_BAD_ARG); return; }
+                xSemaphoreTake(stateMutex, portMAX_DELAY);
+                alertText = "";
+                for (size_t i = 2; i < len; i++) { alertText += (char)data[i]; }
+                alertText.toUpperCase();
+                alertColor = panelColors[data[1] == 1 ? COLOR_ALERT_GAME : COLOR_ALERT_PERIOD];
+                alertStartMillis = millis();
+                alertActive = true;
+                xSemaphoreGive(stateMutex);
+                reply(CMD_ALERT, CFG_OK);
                 break;
             }
             case CMD_APPLY: {
@@ -231,6 +422,12 @@ void setup() {
 
   dma_display = new MatrixPanel_I2S_DMA(mxconfig); dma_display->begin();
   dma_display->setBrightness8(brightness);
+  loadPanelColors();
+  frame = new GFXcanvas16(PANEL_RES_X, PANEL_RES_Y);
+  slotCanvas = new GFXcanvas16(NAME_SLOT_W, NAME_SLOT_H);
+  stateMutex = xSemaphoreCreateMutex();
+  marqueeSet(homeMarquee, homeName);
+  marqueeSet(awayMarquee, awayName);
   drawScoreboard();
 
   // 📡 SILENT BACKGROUND WI-FI OTA INITIALIZATION
@@ -266,6 +463,7 @@ void setup() {
   char nameBuffer[32];
   deviceBroadcastName.toCharArray(nameBuffer, 32);
   BLEDevice::init(nameBuffer);
+  BLEDevice::setMTU(185);   // default is 23 (20 bytes per write), too small for names plus the 8-byte header
   
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ScoreboardServerCallbacks()); 
@@ -295,6 +493,29 @@ void setup() {
 
 void loop() {
   unsigned long currentMillis = millis();
+
+  // Clock, scrolling names and redraw. The clock keeps counting here even if the phone link drops.
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  if (isTimerRunning && currentMillis - lastTickMillis >= 1000) {
+    lastTickMillis += 1000;
+    if (currentMillis - lastTickMillis > 2000) lastTickMillis = currentMillis;  // far behind: resync instead of catching up
+    if (timerSec > 0) timerSec--;
+    else if (timerMin > 0) { timerMin--; timerSec = 59; }
+    else isTimerRunning = false;
+    sceneDirty = true;
+  }
+  if (currentMillis - lastMarqueeStep >= MARQUEE_STEP_MS) {
+    lastMarqueeStep = currentMillis;
+    bool movedHome = marqueeStep(homeMarquee), movedAway = marqueeStep(awayMarquee);
+    if (movedHome || movedAway) sceneDirty = true;
+  }
+  if (alertActive) {
+    unsigned long elapsed = currentMillis - alertStartMillis;
+    unsigned long total = (unsigned long)(PANEL_RES_X + textUnits(alertText) * 3) * ALERT_MS_PER_PX + ALERT_TAIL_MS;
+    if (elapsed >= total) { alertActive = false; sceneDirty = true; }          // back to the scoreboard
+    else if (currentMillis - lastAlertDraw >= 20) { lastAlertDraw = currentMillis; drawAlertFrame(elapsed); }
+  } else if (sceneDirty) { sceneDirty = false; drawScoreboard(); }
+  xSemaphoreGive(stateMutex);
 
   // Handle background wireless Arduino IDE port listening check requests
   static unsigned long lastWifiLogMillis = 0;
@@ -334,9 +555,13 @@ void loop() {
       statusLED.setPixelColor(0, blinkToggleState ? statusLED.Color(0, 150, 200) : statusLED.Color(0, 0, 0)); statusLED.show();
       if (currentMillis - stateTransitionMillis >= 30000) {
         currentBLEState = SEARCHING_NEW;
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
         hasReceivedState = false;
-        homeScore = 0; awayScore = 0; period = 1; homeName = "HOME"; awayName = "AWAY"; periodRatio = "1/4"; bottomClockString = "00:00";
-        drawScoreboard();
+        homeScore = 0; awayScore = 0; period = 1; totalPeriods = 4; homeName = "HOME"; awayName = "AWAY";
+        timerMin = 10; timerSec = 0; isTimerRunning = false;
+        marqueeSet(homeMarquee, homeName); marqueeSet(awayMarquee, awayName);
+        sceneDirty = true;
+        xSemaphoreGive(stateMutex);
       }
     }
   }
