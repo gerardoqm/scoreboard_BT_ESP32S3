@@ -51,8 +51,12 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 #define CMD_SET_NAME 0x01   // args: 1-20 printable ASCII bytes; staged, not saved yet
 #define CMD_APPLY    0x02   // saves the staged name and reboots
 #define CMD_SET_COLORS 0x03 // args: 9 x RGB565 big-endian, in the PanelColor order below; saved to flash
-#define CMD_ALERT      0x04 // args: type (1 = game start, 2 = period start) + 1-16 ASCII characters to scroll
+#define CMD_ALERT      0x04 // args: type (1 = game start, 2 = period start, 3 = goal, with the icon if one is loaded) + 1-16 ASCII characters to scroll
 #define CMD_SET_VISIBILITY 0x05 // args: 2 bytes, little-endian bitmask, bit i set = PanelColor i is shown; saved to flash
+#define CMD_ALERT_ICON 0x06 // args: first row (0-15) + 1-4 rows of 16 pixels, RGB565 big-endian (32 bytes per row); no args = remove the icon
+                            // The goal alert (CMD_ALERT type 3) scrolls this 16x16 picture in front of its text.
+#define CMD_NAME_ICON  0x07 // args: slot (0-3), first row (0-9) + 1-5 rows of 10 pixels, RGB565 big-endian (20 bytes per row); slot alone = clear it
+                            // A team name shows icon N (1-4) where it holds the byte N: slots 0-1 for the home name, 2-3 for the away name.
 // Firmware update over Bluetooth: own characteristic. Phone -> board writes start with an opcode; replies are
 // notifications [opcode, status, ...]. Data chunks are written without response and acknowledged every 4 KB.
 #define OTA_UUID           "87654321-4321-4321-4321-210987654323"
@@ -73,7 +77,8 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 #define OTA_ERR_LOCKED     0x07
 #define OTA_ERR_TIMEOUT    0x08
 #define OTA_RING_SIZE      16384
-#define OTA_ACK_EVERY      4096
+#define OTA_ACK_EVERY      2048
+#define OTA_ACK_REPEAT_MS  250    // the progress ACK is repeated while receiving, so one lost notification cannot freeze the transfer
 #define OTA_IDLE_TIMEOUT_MS 20000
 #define ALERT_TEXT_MAX 16
 #define ALERT_MS_PER_PX 18   // scroll speed of the alert text (about 55 px/s)
@@ -89,14 +94,16 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // v2 adds:                    [flags, protocolVersion]  (7 bytes)
 // v3 adds the CMD_SET_COLORS and CMD_ALERT config commands (panel text colors, start-of-game/period alerts).
 // v4 adds CMD_SET_VISIBILITY (hide or show each element of the panel).
+// v6 adds CMD_ALERT_ICON and the goal alert (CMD_ALERT type 3).
+// v7 adds CMD_NAME_ICON: emoji pictures inside team names.
 // v5 adds firmware updates over Bluetooth (OTA characteristic) and the firmware version as bytes 7-9 of the telemetry (10 bytes).
-#define PROTOCOL_VERSION 5
+#define PROTOCOL_VERSION 7
 // Firmware version, semantic: bump PATCH for fixes, MINOR for features that stay compatible, MAJOR for breaking changes.
 // Sent in the telemetry (bytes 7-9) so the app can show it and compare it with the image bundled in the app.
 // PROTOCOL_VERSION above is only for the app's feature checks; the version below is what people see.
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 0
-#define FW_VERSION_PATCH 1
+#define FW_VERSION_MINOR 2
+#define FW_VERSION_PATCH 2
 #define FLAG_LOW_BATTERY    0x01  // battery below 15%
 #define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
 
@@ -144,6 +151,11 @@ SemaphoreHandle_t stateMutex = nullptr;
 bool alertActive = false;
 unsigned long alertStartMillis = 0, lastAlertDraw = 0;
 String alertText = "";
+#define NAME_ICON_PX 10                 // emoji inside team names: 10 x 10 pixels, the height of a name line
+uint16_t nameIcons[4][NAME_ICON_PX * NAME_ICON_PX];   // RGB565, 0 = transparent
+uint16_t alertIcon[16 * 16];            // goal icon, RGB565; 0 = transparent
+uint16_t alertIconRows = 0;             // bit r set = row r has been received; all 16 = the icon is complete
+bool alertUsesIcon = false;
 uint16_t alertColor = 0;
 volatile bool sceneDirty = true;     // something changed and the panel needs a redraw
 unsigned long lastTickMillis = 0;    // phase of the board's own 1 s clock tick
@@ -230,17 +242,32 @@ static const Glyph *glyphFor(char c) {
   return glyphFor('-');                            // anything else (accents are stripped by the app anyway)
 }
 
+// The bytes 1-4 in a name stand for the emoji pictures in nameIcons; they are 5 font units (10 pixels at 2x) wide.
+static inline bool isIconChar(char c) { return c >= 1 && c <= 4; }
+
 // Width of a string in font pixels (1 pixel between letters).
 static int textUnits(const String &t) {
   if (t.length() == 0) return 0;
   int u = -1;
-  for (size_t i = 0; i < t.length(); i++) u += glyphFor(t[i])->w + 1;
+  for (size_t i = 0; i < t.length(); i++) u += (isIconChar(t[i]) ? 5 : glyphFor(t[i])->w) + 1;
   return u;
 }
 
 // Draws text at pixel scale s. Drawing outside the canvas is clipped.
 static void drawText(GFXcanvas16 *cv, int x, int y, const String &t, uint16_t color, int s) {
   for (size_t i = 0; i < t.length(); i++) {
+    if (isIconChar(t[i])) {                        // emoji picture: 10 pixels at the 2x name size, 15 at the 3x alert size
+      if (s == 2 || s == 3) {
+        const uint16_t *icon = nameIcons[t[i] - 1];
+        int n = NAME_ICON_PX * s / 2;
+        for (int r = 0; r < n; r++) for (int c = 0; c < n; c++) {
+          uint16_t px = icon[(r * NAME_ICON_PX / n) * NAME_ICON_PX + (c * NAME_ICON_PX / n)];
+          if (px) cv->drawPixel(x + c, y + r, px);
+        }
+      }
+      x += 6 * s;
+      continue;
+    }
     const Glyph *g = glyphFor(t[i]);
     for (int row = 0; row < 5; row++)
       for (int col = 0; col < g->w; col++)
@@ -300,7 +327,15 @@ void drawAlertFrame(unsigned long elapsed) {
     frame->drawRect(0, 0, PANEL_RES_X, PANEL_RES_Y, alertColor);
     frame->drawRect(1, 1, PANEL_RES_X - 2, PANEL_RES_Y - 2, alertColor);
   }
-  drawText(frame, PANEL_RES_X - (int)(elapsed / ALERT_MS_PER_PX), 12, alertText, alertColor, 3);
+  int textX = PANEL_RES_X - (int)(elapsed / ALERT_MS_PER_PX);
+  drawText(frame, textX, 12, alertText, alertColor, 3);
+  if (alertUsesIcon) {                           // the icon rides in front of the text
+    int iconX = textX - 19, iconY = 12;
+    for (int r = 0; r < 16; r++) for (int c = 0; c < 16; c++) {
+      uint16_t px = alertIcon[r * 16 + c];
+      if (px) frame->drawPixel(iconX + c, iconY + r, px);
+    }
+  }
   dma_display->drawRGBBitmap(0, 0, frame->getBuffer(), PANEL_RES_X, PANEL_RES_Y);
 }
 
@@ -452,17 +487,55 @@ class ConfigCallbacks: public BLECharacteristicCallbacks {
                 reply(CMD_SET_VISIBILITY, CFG_OK);
                 break;
             }
+            case CMD_NAME_ICON: {
+                if (len == 2 && data[1] < 4) {                       // clear the slot
+                    xSemaphoreTake(stateMutex, portMAX_DELAY);
+                    memset(nameIcons[data[1]], 0, sizeof(nameIcons[0])); sceneDirty = true;
+                    xSemaphoreGive(stateMutex);
+                    reply(CMD_NAME_ICON, CFG_OK); break;
+                }
+                size_t rows = (len >= 3) ? (len - 3) / (NAME_ICON_PX * 2) : 0;
+                if (len < 3 + NAME_ICON_PX * 2 || (len - 3) % (NAME_ICON_PX * 2) != 0 || data[1] > 3 || data[2] > NAME_ICON_PX - 1 || data[2] + rows > NAME_ICON_PX) {
+                    reply(CMD_NAME_ICON, CFG_BAD_ARG); return;
+                }
+                xSemaphoreTake(stateMutex, portMAX_DELAY);
+                for (size_t r = 0; r < rows; r++)
+                    for (int c = 0; c < NAME_ICON_PX; c++) {
+                        const uint8_t *px = &data[3 + (r * NAME_ICON_PX + c) * 2];
+                        nameIcons[data[1]][(data[2] + r) * NAME_ICON_PX + c] = ((uint16_t)px[0] << 8) | px[1];
+                    }
+                sceneDirty = true;
+                xSemaphoreGive(stateMutex);
+                reply(CMD_NAME_ICON, CFG_OK);
+                break;
+            }
+            case CMD_ALERT_ICON: {
+                if (len == 1) { alertIconRows = 0; reply(CMD_ALERT_ICON, CFG_OK); break; }          // remove the icon
+                size_t rows = (len >= 2) ? (len - 2) / 32 : 0;
+                if (len < 34 || (len - 2) % 32 != 0 || data[1] > 15 || data[1] + rows > 16) { reply(CMD_ALERT_ICON, CFG_BAD_ARG); return; }
+                for (size_t r = 0; r < rows; r++) {
+                    for (int c = 0; c < 16; c++) {
+                        const uint8_t *px = &data[2 + r * 32 + c * 2];
+                        alertIcon[(data[1] + r) * 16 + c] = ((uint16_t)px[0] << 8) | px[1];
+                    }
+                    alertIconRows |= (uint16_t)(1u << (data[1] + r));
+                }
+                reply(CMD_ALERT_ICON, CFG_OK);
+                break;
+            }
             case CMD_ALERT: {
                 size_t textLen = len - 2;
-                bool valid = len >= 3 && textLen <= ALERT_TEXT_MAX && (data[1] == 1 || data[1] == 2);
-                for (size_t i = 2; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E); }
+                bool valid = len >= 3 && textLen <= ALERT_TEXT_MAX && (data[1] == 1 || data[1] == 2 || data[1] == 3);
+                for (size_t i = 2; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E) || (data[1] == 3 && isIconChar((char)data[i])); }   // goal alerts may carry the team's emoji (bytes 1-4)
                 if (!valid) { reply(CMD_ALERT, CFG_BAD_ARG); return; }
-                if (!shown(data[1] == 1 ? COLOR_ALERT_GAME : COLOR_ALERT_PERIOD)) { reply(CMD_ALERT, CFG_OK); return; }   // this alert is switched off
+                bool isPeriod = (data[1] == 2);                       // goal alerts share the game start alert's color and switch
+                if (!shown(isPeriod ? COLOR_ALERT_PERIOD : COLOR_ALERT_GAME)) { reply(CMD_ALERT, CFG_OK); return; }   // this alert is switched off
                 xSemaphoreTake(stateMutex, portMAX_DELAY);
                 alertText = "";
                 for (size_t i = 2; i < len; i++) { alertText += (char)data[i]; }
                 alertText.toUpperCase();
-                alertColor = panelColors[data[1] == 1 ? COLOR_ALERT_GAME : COLOR_ALERT_PERIOD];
+                alertColor = panelColors[isPeriod ? COLOR_ALERT_PERIOD : COLOR_ALERT_GAME];
+                alertUsesIcon = (data[1] == 3 && alertIconRows == 0xFFFF);
                 alertStartMillis = millis();
                 alertActive = true;
                 xSemaphoreGive(stateMutex);
@@ -499,6 +572,29 @@ static uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t len) {
   return crc;
 }
 
+// Wi-Fi and Bluetooth share one radio: an idle-looking Wi-Fi connection still costs Bluetooth packets, which stalls a long transfer.
+// So Wi-Fi is switched off while a Bluetooth update runs and comes back when it ends or fails.
+static bool wifiPausedForOta = false;
+static bool otaWifiRestartPending = false;
+
+static void otaWifiPause() {
+  if (wifiPausedForOta) return;
+  wifiPausedForOta = true;
+  ArduinoOTA.end();
+  otaWifiRestartPending = true;                   // loop() starts ArduinoOTA again once Wi-Fi is back
+  WiFi.disconnect(true, false);
+  WiFi.mode(WIFI_OFF);
+  Serial.println("[ble-ota] Wi-Fi off for the update");
+}
+
+static void otaWifiResume() {
+  if (!wifiPausedForOta) return;
+  wifiPausedForOta = false;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.println("[ble-ota] Wi-Fi back on");
+}
+
 static void otaNotifyData(uint8_t op, uint8_t status, const uint8_t *extra, size_t extraLen) {
   uint8_t buf[20];
   buf[0] = op; buf[1] = status;
@@ -509,12 +605,14 @@ static void otaNotifyData(uint8_t op, uint8_t status, const uint8_t *extra, size
 
 // Gives up on the current update: discards what was written, tells the phone why, and returns to the scoreboard.
 static void otaFail(uint8_t op, uint8_t status) {
+  Serial.printf("[ble-ota] failed: op %u status %u after %u of %u bytes\n", op, status, (unsigned)otaWritten, (unsigned)otaSize);
   if (otaState == FWU_STARTING || otaState == FWU_RECEIVING) Update.abort();
   otaState = FWU_IDLE;
   otaEndRequested = false; otaAbortRequested = false; otaOverflow = false;
   otaHead = otaTail = 0;
   otaNotifyData(op, status, nullptr, 0);
   sceneDirty = true;
+  otaWifiResume();
 }
 
 class OtaCallbacks: public BLECharacteristicCallbacks {
@@ -586,20 +684,26 @@ static void otaService() {
   unsigned long now = millis();
 
   if (otaAbortRequested) {
+    Serial.printf("[ble-ota] aborted (phone cancelled or link lost) after %u of %u bytes\n", (unsigned)otaWritten, (unsigned)otaSize);
     if (otaState == FWU_STARTING || otaState == FWU_RECEIVING) Update.abort();
     otaState = FWU_IDLE; otaAbortRequested = false; otaEndRequested = false; otaHead = otaTail = 0;
     sceneDirty = true;
+    otaWifiResume();
     return;
   }
-  if (now - otaLastActivity > OTA_IDLE_TIMEOUT_MS) { otaFail(OTA_OP_ABORT, OTA_ERR_TIMEOUT); return; }
+  if (now - otaLastActivity > OTA_IDLE_TIMEOUT_MS) { Serial.println("[ble-ota] nothing received for 20 s"); otaFail(OTA_OP_ABORT, OTA_ERR_TIMEOUT); return; }
 
   if (otaState == FWU_STARTING) {
+    otaWifiPause();
+    Serial.printf("[ble-ota] start: %u bytes, crc %08x\n", (unsigned)otaSize, (unsigned)otaExpectedCrc);
     if (Update.begin(otaSize)) {
       otaState = FWU_RECEIVING; otaLastActivity = millis();
       otaNotifyData(OTA_OP_START, OTA_OK, nullptr, 0);
     } else {
+      Serial.printf("[ble-ota] Update.begin failed: %s\n", Update.errorString());
       otaState = FWU_IDLE; sceneDirty = true;
       otaNotifyData(OTA_OP_START, OTA_ERR_WRITE, nullptr, 0);
+      otaWifiResume();
     }
     return;
   }
@@ -611,16 +715,19 @@ static void otaService() {
       uint32_t idx = otaTail % OTA_RING_SIZE;
       uint32_t n = min(avail, (uint32_t)(OTA_RING_SIZE - idx));
       if (n > 2048) n = 2048;
-      if (Update.write(&otaRing[idx], n) != n) { otaFail(OTA_OP_DATA, OTA_ERR_WRITE); return; }
+      if (Update.write(&otaRing[idx], n) != n) { Serial.printf("[ble-ota] flash write failed: %s\n", Update.errorString()); otaFail(OTA_OP_DATA, OTA_ERR_WRITE); return; }
       otaCrc = crc32Update(otaCrc, &otaRing[idx], n);
       otaWritten += n;
       __sync_synchronize();
       otaTail = otaTail + n;
       avail -= n;
       otaLastActivity = millis();
+      static uint32_t lastLogged = 0;
+      if (otaWritten - lastLogged >= 65536 || otaWritten == otaSize) { lastLogged = otaWritten; Serial.printf("[ble-ota] %u / %u bytes\n", (unsigned)otaWritten, (unsigned)otaSize); }
     }
-    if (otaWritten - otaLastAck >= OTA_ACK_EVERY || (otaWritten == otaSize && otaLastAck != otaWritten)) {
-      otaLastAck = otaWritten;
+    static unsigned long lastAckMillis = 0;
+    if (otaWritten - otaLastAck >= OTA_ACK_EVERY || (otaWritten == otaSize && otaLastAck != otaWritten) || (now - lastAckMillis >= OTA_ACK_REPEAT_MS && otaHead == otaTail)) {
+      otaLastAck = otaWritten; lastAckMillis = now;
       uint8_t ack[5] = { OTA_OP_ACK, (uint8_t)otaWritten, (uint8_t)(otaWritten >> 8), (uint8_t)(otaWritten >> 16), (uint8_t)(otaWritten >> 24) };
       pOtaChar->setValue(ack, sizeof(ack));
       pOtaChar->notify();
@@ -630,8 +737,11 @@ static void otaService() {
       else if ((~otaCrc) != otaExpectedCrc)   otaFail(OTA_OP_END, OTA_ERR_CRC);
       else if (!Update.end(true))             otaFail(OTA_OP_END, OTA_ERR_WRITE);
       else {                                   // image is in place and verified: tell the phone, then boot into it
+        Serial.println("[ble-ota] image verified, restarting");
         otaNotifyData(OTA_OP_END, OTA_OK, nullptr, 0);
-        delay(800);
+        statusLED.setPixelColor(0, statusLED.Color(0, 200, 0)); statusLED.show();     // green: done
+        xSemaphoreTake(stateMutex, portMAX_DELAY); otaWritten = otaSize; drawOtaScreen(); xSemaphoreGive(stateMutex);
+        delay(2000);
         ESP.restart();
       }
     }
@@ -771,12 +881,13 @@ void loop() {
                   currentBLEState == LINKED_CONNECTED ? "linked" : "waiting");
   }
   static bool otaStarted = false;
-  if (!otaStarted && WiFi.status() == WL_CONNECTED) {
+  if (!otaStarted && !wifiPausedForOta && WiFi.status() == WL_CONNECTED) {
     ArduinoOTA.begin();
     otaStarted = true;
     Serial.printf("[ota] ready as %s.local\n", ArduinoOTA.getHostname().c_str());
   }
-  if (otaStarted) ArduinoOTA.handle();
+  if (otaWifiRestartPending && !wifiPausedForOta) { otaStarted = false; otaWifiRestartPending = false; }   // Wi-Fi was cycled: start ArduinoOTA again once it reconnects
+  if (otaStarted && !wifiPausedForOta) ArduinoOTA.handle();
 
   static unsigned long lastNotifyMillis = 0;
   if (currentBLEState == LINKED_CONNECTED && currentMillis - lastNotifyMillis >= 2000) {
@@ -789,11 +900,17 @@ void loop() {
      pChar->setValue(telemetryPacket, sizeof(telemetryPacket)); pChar->notify();
   }
 
-  if (currentMillis - lastBlinkMillis >= 400) {
+  if (currentMillis - lastBlinkMillis >= (otaState != FWU_IDLE ? 250 : 400)) {
     lastBlinkMillis = currentMillis;
     blinkToggleState = !blinkToggleState;
 
-    if (currentBLEState == SEARCHING_NEW) {
+    if (otaState != FWU_IDLE) {                      // firmware update running: blink red until it is done
+      statusLED.setPixelColor(0, blinkToggleState ? statusLED.Color(200, 0, 0) : statusLED.Color(0, 0, 0)); statusLED.show();
+    }
+    else if (currentBLEState == LINKED_CONNECTED) {  // back to solid green (an update may have just ended or failed)
+      statusLED.setPixelColor(0, statusLED.Color(0, 150, 0)); statusLED.show();
+    }
+    else if (currentBLEState == SEARCHING_NEW) {
       statusLED.setPixelColor(0, blinkToggleState ? statusLED.Color(0, 0, 200) : statusLED.Color(0, 0, 0)); statusLED.show();
     } 
     else if (currentBLEState == RETRYING_PAST) {
