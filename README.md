@@ -6,7 +6,7 @@ This repository contains the resilient, optimized C++ firmware required to trans
 
 - **Pure Display Slave Architecture:** All complex string formatting, language localizations, and clock cycles are handled by the paired iPhone application. The chip extracts layout control bytes and instantly draws what the app transmits, preventing processing lag.
 - **Persistent Naming & Renaming:** Allows users to name their board dynamically from the smartphone remote (e.g., *"Juan's Board"*). The string is saved securely to non-volatile internal flash memory using the `Preferences` library and automatically updates the BLE broadcast identity profile.
-- **Configurable Colors:** The phone app sets the color of the timer (running and stopped), the period, each team's name and score, and the two start alerts. The board saves them in flash (`CMD_SET_COLORS`), so they survive reboots.
+- **Configurable Colors:** The phone app sets the color of the timer (running and stopped), the period, each team's name and score, and the two start alerts. The board saves them in flash (`CMD_SET_COLORS`), so they survive reboots. A visibility bitmask (`CMD_SET_VISIBILITY`) hides any element, including either start alert, and is saved in flash too.
 - **Start Alerts:** When the app starts a game or period it sends `CMD_ALERT`: the border flashes and the message scrolls across the whole panel at 3x in the alert's color, then the scoreboard returns.
 - **Smart Connection Recovery & Timeout:** 
   - *Searching:* Onboard RGB NeoPixel blinks **Solid Blue**.
@@ -112,7 +112,7 @@ Panel behavior:
 | 3 | Period | |
 | 4 | Battery % | 0-100 |
 | 5 | Flags | bit 0 = battery below 15%, bit 1 = a new name is staged |
-| 6 | Protocol version | currently `3` (colors); bytes 5-6 are absent on version 1 firmware |
+| 6 | Protocol version | currently `4` (colors, alerts, visibility); bytes 5-6 are absent on version 1 firmware |
 
 The app shows "firmware outdated" when it receives a shorter packet or a lower version than it expects. Bump `PROTOCOL_VERSION` in the sketch and `expectedProtocolVersion` in the app together whenever a layout changes.
 
@@ -126,6 +126,7 @@ Write `[command, args...]` to the config characteristic; each command is answere
 | `0x02` Apply | `02` | Saves the staged name to flash and reboots |
 | `0x03` Set colors | `03` + 9 x RGB565 (2 bytes each, big-endian) | Sets the color of each piece of panel text and saves them to flash. Order: timer running, timer stopped, period, home name, home score, away name, away score, game start alert, period start alert |
 | `0x04` Alert | `04`, type (`1` game start, `2` period start), 1-16 ASCII characters | Plays the alert: the text scrolls across the whole panel at 3x in the alert's color while the border flashes, then the scoreboard returns |
+| `0x05` Set visibility | `05` + 2 bytes, little-endian bitmask | Bit i set shows element i, in the same order as the colors (timer running, timer stopped, period, home name, home score, away name, away score, game start alert, period start alert). The timer uses the running bit for both states. A cleared alert bit means that alert does not play. Saved to flash |
 
 ### Connection states
 After the first state packet of a session, an unexpected disconnect starts a 30 second cyan "retrying" window for the same phone. If no state was received yet, or the window expires, the board returns to blue "searching" and resets the display.

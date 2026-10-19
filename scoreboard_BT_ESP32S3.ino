@@ -49,6 +49,7 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 #define CMD_APPLY    0x02   // saves the staged name and reboots
 #define CMD_SET_COLORS 0x03 // args: 9 x RGB565 big-endian, in the PanelColor order below; saved to flash
 #define CMD_ALERT      0x04 // args: type (1 = game start, 2 = period start) + 1-16 ASCII characters to scroll
+#define CMD_SET_VISIBILITY 0x05 // args: 2 bytes, little-endian bitmask, bit i set = PanelColor i is shown; saved to flash
 #define ALERT_TEXT_MAX 16
 #define ALERT_MS_PER_PX 18   // scroll speed of the alert text (about 55 px/s)
 #define ALERT_FLASH_MS 250   // the border flashes at 2 Hz
@@ -62,7 +63,8 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // Telemetry (5 bytes in v1): [min, sec, running, period, battery%]
 // v2 adds:                    [flags, protocolVersion]  (7 bytes)
 // v3 adds the CMD_SET_COLORS and CMD_ALERT config commands (panel text colors, start-of-game/period alerts).
-#define PROTOCOL_VERSION 3
+// v4 adds CMD_SET_VISIBILITY (hide or show each element of the panel).
+#define PROTOCOL_VERSION 4
 #define FLAG_LOW_BATTERY    0x01  // battery below 15%
 #define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
 
@@ -79,6 +81,8 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 enum PanelColor { COLOR_TIMER_RUNNING, COLOR_TIMER_STOPPED, COLOR_PERIOD, COLOR_HOME_NAME, COLOR_HOME_SCORE,
                   COLOR_AWAY_NAME, COLOR_AWAY_SCORE, COLOR_ALERT_GAME, COLOR_ALERT_PERIOD, COLOR_COUNT };
 uint16_t panelColors[COLOR_COUNT];
+uint16_t panelVisible = 0x01FF;   // bit i set = element i is shown (all nine by default)
+
 
 // Core Board Counters
 int homeScore = 0, awayScore = 0, period = 1, totalPeriods = 4, brightness = 40;
@@ -170,6 +174,12 @@ static const Glyph GLYPHS[] = {
 };
 static const int GLYPH_COUNT = sizeof(GLYPHS) / sizeof(GLYPHS[0]);
 
+// The timer has one switch for both of its colors: running and stopped share the running bit.
+static inline bool shown(PanelColor c) {
+  if (c == COLOR_TIMER_STOPPED) c = COLOR_TIMER_RUNNING;
+  return (panelVisible >> c) & 1;
+}
+
 static const Glyph *glyphFor(char c) {
   if (c >= 'a' && c <= 'z') c -= 32;               // the font has capitals only
   for (int i = 0; i < GLYPH_COUNT; i++) if (GLYPHS[i].ch == c) return &GLYPHS[i];
@@ -235,6 +245,7 @@ void loadPanelColors() {
   panelColors[COLOR_ALERT_PERIOD]  = c565(0, 220, 255);
   prefs.begin("scoreboard", true);
   if (prefs.getBytesLength("colors") == sizeof(panelColors)) prefs.getBytes("colors", panelColors, sizeof(panelColors));
+  panelVisible = prefs.getUShort("visible", 0x01FF) & 0x01FF;
   prefs.end();
 }
 
@@ -274,16 +285,16 @@ void drawScoreboard() {
   // timer on the left (green while running, orange when stopped), period on the right
   char clock[6];
   snprintf(clock, sizeof(clock), "%02d:%02d", timerMin, timerSec);
-  drawText(frame, 2, 1, String(clock), panelColors[isTimerRunning ? COLOR_TIMER_RUNNING : COLOR_TIMER_STOPPED], 2);
+  if (shown(COLOR_TIMER_RUNNING)) drawText(frame, 2, 1, String(clock), panelColors[isTimerRunning ? COLOR_TIMER_RUNNING : COLOR_TIMER_STOPPED], 2);
   String periodText = String(period) + "/" + String(totalPeriods);
-  drawText(frame, 78 - textUnits(periodText) * 2, 1, periodText, panelColors[COLOR_PERIOD], 2);
+  if (shown(COLOR_PERIOD)) drawText(frame, 78 - textUnits(periodText) * 2, 1, periodText, panelColors[COLOR_PERIOD], 2);
 
   frame->drawFastVLine(40, 12, 26, c565(40, 40, 40));   // between the two teams
 
-  drawScore(homeScore, 20, panelColors[COLOR_HOME_SCORE]);
-  drawScore(awayScore, 60, panelColors[COLOR_AWAY_SCORE]);
-  drawName(homeMarquee, 2, panelColors[COLOR_HOME_NAME]);
-  drawName(awayMarquee, 42, panelColors[COLOR_AWAY_NAME]);
+  if (shown(COLOR_HOME_SCORE)) drawScore(homeScore, 20, panelColors[COLOR_HOME_SCORE]);
+  if (shown(COLOR_AWAY_SCORE)) drawScore(awayScore, 60, panelColors[COLOR_AWAY_SCORE]);
+  if (shown(COLOR_HOME_NAME)) drawName(homeMarquee, 2, panelColors[COLOR_HOME_NAME]);
+  if (shown(COLOR_AWAY_NAME)) drawName(awayMarquee, 42, panelColors[COLOR_AWAY_NAME]);
 
   dma_display->drawRGBBitmap(0, 0, frame->getBuffer(), PANEL_RES_X, PANEL_RES_Y);
 }
@@ -372,11 +383,23 @@ class ConfigCallbacks: public BLECharacteristicCallbacks {
                 reply(CMD_SET_COLORS, CFG_OK);
                 break;
             }
+            case CMD_SET_VISIBILITY: {
+                if (len != 3) { reply(CMD_SET_VISIBILITY, CFG_BAD_ARG); return; }
+                uint16_t mask = ((uint16_t)data[1] | ((uint16_t)data[2] << 8)) & 0x01FF;
+                xSemaphoreTake(stateMutex, portMAX_DELAY);
+                panelVisible = mask;
+                sceneDirty = true;
+                xSemaphoreGive(stateMutex);
+                prefs.begin("scoreboard", false); prefs.putUShort("visible", mask); prefs.end();
+                reply(CMD_SET_VISIBILITY, CFG_OK);
+                break;
+            }
             case CMD_ALERT: {
                 size_t textLen = len - 2;
                 bool valid = len >= 3 && textLen <= ALERT_TEXT_MAX && (data[1] == 1 || data[1] == 2);
                 for (size_t i = 2; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E); }
                 if (!valid) { reply(CMD_ALERT, CFG_BAD_ARG); return; }
+                if (!shown(data[1] == 1 ? COLOR_ALERT_GAME : COLOR_ALERT_PERIOD)) { reply(CMD_ALERT, CFG_OK); return; }   // this alert is switched off
                 xSemaphoreTake(stateMutex, portMAX_DELAY);
                 alertText = "";
                 for (size_t i = 2; i < len; i++) { alertText += (char)data[i]; }
