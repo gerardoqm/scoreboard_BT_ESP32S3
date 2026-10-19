@@ -112,7 +112,8 @@ Panel behavior:
 | 3 | Period | |
 | 4 | Battery % | 0-100 |
 | 5 | Flags | bit 0 = battery below 15%, bit 1 = a new name is staged |
-| 6 | Protocol version | currently `4` (colors, alerts, visibility); bytes 5-6 are absent on version 1 firmware |
+| 6 | Protocol version | currently `5`; the app uses it only to know which commands the board understands |
+| 7-9 | Firmware version | major, minor, patch (for example `1`, `0`, `0` is version 1.0.0); absent on firmware older than 1.0.0 |
 
 The app shows "firmware outdated" when it receives a shorter packet or a lower version than it expects. Bump `PROTOCOL_VERSION` in the sketch and `expectedProtocolVersion` in the app together whenever a layout changes.
 
@@ -140,6 +141,33 @@ After the first state packet of a session, an unexpected disconnect starts a 30 
 ### HUB75 connector
 
 <p align="center"><img src="docs/hub75-pinout.svg" alt="HUB75 connector pinout showing each of the 16 pins and the ESP32-S3 GPIO it connects to" width="680"></p>
+
+
+## 🏷️ Versions
+
+The firmware has a version number, `major.minor.patch`, set by `FW_VERSION_MAJOR`, `FW_VERSION_MINOR` and `FW_VERSION_PATCH` at the top of the sketch. Bump **patch** for fixes, **minor** for features that stay compatible, and **major** for breaking changes. The board reports it in its telemetry, and the app shows it and offers an update when the firmware bundled in the app is newer. `PROTOCOL_VERSION` is separate and internal: it only tells the app which commands the board understands. See [CHANGELOG.md](CHANGELOG.md).
+
+## 📶 Updating over Bluetooth
+
+After the first USB flash of a version that includes it, the board can be updated from the phone: open **Board Firmware** in the app and tap **Update board firmware**. The panel shows a progress bar and the board restarts when it is done.
+
+- The app carries the firmware image. Build it with `tools/bundle-firmware.sh` in the app repository; the script also writes the update key from `secrets.h` next to the image, so nobody types a password. That folder is git-ignored because the image contains your Wi-Fi and update passwords. Never commit it.
+- The board only accepts a transfer after the app answers a random challenge (HMAC-SHA256 of a nonce with `OTA_PASSWORD`); three wrong answers lock it for 30 seconds.
+- The image is written to the spare firmware slot, checked with a CRC-32, and only then does the board switch to it. If anything fails the board keeps its current firmware. There is no automatic rollback if a new image crashes right after starting; a USB flash fixes that.
+- Wi-Fi and USB updates keep working.
+
+OTA characteristic `87654321-4321-4321-4321-210987654323` (write, write without response, notify). Messages from the phone start with an opcode; replies are notifications `[opcode, status, ...]`:
+
+| Opcode | Message | Reply |
+| :--- | :--- | :--- |
+| `0x01` Begin | `01` | `01, status, 16-byte nonce` |
+| `0x02` Auth | `02` + HMAC-SHA256(key, nonce), 32 bytes | `02, status` |
+| `0x03` Start | `03` + size (u32 LE) + CRC-32 (u32 LE) | `03, status` once the slot is erased |
+| `0x04` Data | `04` + up to 180 bytes, written without response | `05` + bytes written (u32 LE) every 4 KB |
+| `0x06` End | `06`, sent after the last acknowledgement | `06, status`, then the board restarts |
+| `0x07` Abort | `07` | none |
+
+Status values: `0` ok, `1` bad argument, `2` wrong state, `3` auth failed, `4` image does not fit, `5` flash error, `6` CRC mismatch, `7` locked, `8` timeout.
 
 ## 🔋 Battery Sizing
 

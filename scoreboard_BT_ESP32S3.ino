@@ -89,9 +89,14 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // v2 adds:                    [flags, protocolVersion]  (7 bytes)
 // v3 adds the CMD_SET_COLORS and CMD_ALERT config commands (panel text colors, start-of-game/period alerts).
 // v4 adds CMD_SET_VISIBILITY (hide or show each element of the panel).
-// v5 adds firmware updates over Bluetooth (OTA characteristic) and the build number as byte 7 of the telemetry (8 bytes).
+// v5 adds firmware updates over Bluetooth (OTA characteristic) and the firmware version as bytes 7-9 of the telemetry (10 bytes).
 #define PROTOCOL_VERSION 5
-#define FW_BUILD 2   // bump with every firmware release; sent in the telemetry so the app can compare it with its bundled image
+// Firmware version, semantic: bump PATCH for fixes, MINOR for features that stay compatible, MAJOR for breaking changes.
+// Sent in the telemetry (bytes 7-9) so the app can show it and compare it with the image bundled in the app.
+// PROTOCOL_VERSION above is only for the app's feature checks; the version below is what people see.
+#define FW_VERSION_MAJOR 1
+#define FW_VERSION_MINOR 0
+#define FW_VERSION_PATCH 1
 #define FLAG_LOW_BATTERY    0x01  // battery below 15%
 #define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
 
@@ -780,7 +785,7 @@ void loop() {
      
      // FIXED: Added array assignment tracking brackets to structure multi-byte list payloads
      uint8_t flags = (batteryPct < 15 ? FLAG_LOW_BATTERY : 0) | (pendingDeviceName.length() > 0 ? FLAG_RENAME_STAGED : 0);
-     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct, flags, PROTOCOL_VERSION, FW_BUILD };
+     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct, flags, PROTOCOL_VERSION, FW_VERSION_MAJOR, FW_VERSION_MINOR, FW_VERSION_PATCH };
      pChar->setValue(telemetryPacket, sizeof(telemetryPacket)); pChar->notify();
   }
 
