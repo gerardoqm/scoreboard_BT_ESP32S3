@@ -91,7 +91,7 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // v4 adds CMD_SET_VISIBILITY (hide or show each element of the panel).
 // v5 adds firmware updates over Bluetooth (OTA characteristic) and the build number as byte 7 of the telemetry (8 bytes).
 #define PROTOCOL_VERSION 5
-#define FW_BUILD 1   // bump with every firmware release; sent in the telemetry so the app can compare it with its bundled image
+#define FW_BUILD 2   // bump with every firmware release; sent in the telemetry so the app can compare it with its bundled image
 #define FLAG_LOW_BATTERY    0x01  // battery below 15%
 #define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
 
