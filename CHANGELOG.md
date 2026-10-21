@@ -2,7 +2,10 @@
 
 Versions follow `major.minor.patch` (see the Versions section of the README).
 
-## 1.2.2 (not released)
+## 1.2.3 (not released)
+- Alert text can be up to 32 characters (was 16), so a goal alert fits a long team name. Protocol version 8.
+
+## 1.2.2
 - A goal alert can carry the scoring team's emoji (the same bytes 1-4 as the names): it is drawn 15 x 15 inside the scrolling text.
 
 ## 1.2.1

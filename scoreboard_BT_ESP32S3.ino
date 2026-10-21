@@ -51,7 +51,7 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 #define CMD_SET_NAME 0x01   // args: 1-20 printable ASCII bytes; staged, not saved yet
 #define CMD_APPLY    0x02   // saves the staged name and reboots
 #define CMD_SET_COLORS 0x03 // args: 9 x RGB565 big-endian, in the PanelColor order below; saved to flash
-#define CMD_ALERT      0x04 // args: type (1 = game start, 2 = period start, 3 = goal, with the icon if one is loaded) + 1-16 ASCII characters to scroll
+#define CMD_ALERT      0x04 // args: type (1 = game start, 2 = period start, 3 = goal, with the icon if one is loaded) + 1-32 ASCII characters to scroll
 #define CMD_SET_VISIBILITY 0x05 // args: 2 bytes, little-endian bitmask, bit i set = PanelColor i is shown; saved to flash
 #define CMD_ALERT_ICON 0x06 // args: first row (0-15) + 1-4 rows of 16 pixels, RGB565 big-endian (32 bytes per row); no args = remove the icon
                             // The goal alert (CMD_ALERT type 3) scrolls this 16x16 picture in front of its text.
@@ -80,7 +80,7 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 #define OTA_ACK_EVERY      2048
 #define OTA_ACK_REPEAT_MS  250    // the progress ACK is repeated while receiving, so one lost notification cannot freeze the transfer
 #define OTA_IDLE_TIMEOUT_MS 20000
-#define ALERT_TEXT_MAX 16
+#define ALERT_TEXT_MAX 32
 #define ALERT_MS_PER_PX 18   // scroll speed of the alert text (about 55 px/s)
 #define ALERT_FLASH_MS 250   // the border flashes at 2 Hz
 #define ALERT_TAIL_MS 400    // flashing continues briefly after the text has left
@@ -96,14 +96,15 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // v4 adds CMD_SET_VISIBILITY (hide or show each element of the panel).
 // v6 adds CMD_ALERT_ICON and the goal alert (CMD_ALERT type 3).
 // v7 adds CMD_NAME_ICON: emoji pictures inside team names.
+// v8 raises the alert text limit from 16 to 32 characters (long team names in goal alerts).
 // v5 adds firmware updates over Bluetooth (OTA characteristic) and the firmware version as bytes 7-9 of the telemetry (10 bytes).
-#define PROTOCOL_VERSION 7
+#define PROTOCOL_VERSION 8
 // Firmware version, semantic: bump PATCH for fixes, MINOR for features that stay compatible, MAJOR for breaking changes.
 // Sent in the telemetry (bytes 7-9) so the app can show it and compare it with the image bundled in the app.
 // PROTOCOL_VERSION above is only for the app's feature checks; the version below is what people see.
 #define FW_VERSION_MAJOR 1
 #define FW_VERSION_MINOR 2
-#define FW_VERSION_PATCH 2
+#define FW_VERSION_PATCH 3
 #define FLAG_LOW_BATTERY    0x01  // battery below 15%
 #define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
 
