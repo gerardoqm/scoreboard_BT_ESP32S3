@@ -1,88 +1,133 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 720" font-family="-apple-system, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 790" font-family="-apple-system, Helvetica, Arial, sans-serif">
   <defs>
     <marker id="arrRed" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="14" markerHeight="14" markerUnits="userSpaceOnUse" orient="auto"><path d="M0 0L10 5L0 10z" fill="#d63031"/></marker>
     <marker id="arrGreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="14" markerHeight="14" markerUnits="userSpaceOnUse" orient="auto"><path d="M0 0L10 5L0 10z" fill="#00a86b"/></marker>
+    <!-- ground symbol: its top point is the connection point -->
+    <g id="gnd" stroke="#2d3436" stroke-width="3" stroke-linecap="round">
+      <line x1="0" y1="0" x2="0" y2="9"/><line x1="-11" y1="9" x2="11" y2="9"/><line x1="-7" y1="14" x2="7" y2="14"/><line x1="-3" y1="19" x2="3" y2="19"/>
+    </g>
   </defs>
-  <rect width="960" height="720" fill="#ffffff"/>
-  <text x="480" y="38" text-anchor="middle" font-size="24" font-weight="700" fill="#1e272e">Power and battery telemetry</text>
+  <rect width="960" height="790" fill="#ffffff"/>
+  <text x="480" y="36" text-anchor="middle" font-size="24" font-weight="700" fill="#1e272e">Power and battery telemetry</text>
 
   <!-- legend -->
   <g font-size="14" fill="#2d3436">
-    <line x1="80" y1="66" x2="116" y2="66" stroke="#d63031" stroke-width="4"/><text x="124" y="71">power (+)</text>
-    <line x1="230" y1="66" x2="266" y2="66" stroke="#2d3436" stroke-width="4"/><text x="274" y="71">ground</text>
-    <line x1="350" y1="66" x2="386" y2="66" stroke="#00a86b" stroke-width="4"/><text x="394" y="71">signal</text>
+    <line x1="60" y1="58" x2="96" y2="58" stroke="#d63031" stroke-width="4"/><text x="104" y="63">power (+)</text>
+    <line x1="210" y1="58" x2="246" y2="58" stroke="#00a86b" stroke-width="4"/><text x="254" y="63">signal</text>
+    <use href="#gnd" x="350" y="48"/><text x="372" y="63">ground (all grounds are joined)</text>
   </g>
 
+  <!-- ===== POWER PATH ===== -->
   <!-- battery -->
-  <rect x="40" y="215" width="170" height="120" rx="14" fill="#fff4e0" stroke="#e67e22" stroke-width="3"/>
-  <text x="125" y="260" text-anchor="middle" font-size="20" font-weight="700" fill="#1e272e">LiPo cell</text>
-  <text x="125" y="285" text-anchor="middle" font-size="16" fill="#2d3436">3.7 - 4.2 V</text>
-  <text x="125" y="308" text-anchor="middle" font-size="14" fill="#636e72">protected pack + fuse</text>
+  <rect x="30" y="205" width="140" height="120" rx="14" fill="#fff4e0" stroke="#e67e22" stroke-width="3"/>
+  <text x="100" y="248" text-anchor="middle" font-size="19" font-weight="700" fill="#1e272e">LiPo cell</text>
+  <text x="100" y="272" text-anchor="middle" font-size="15" fill="#2d3436">3.7 - 4.2 V</text>
+  <text x="100" y="294" text-anchor="middle" font-size="13" fill="#636e72">protected pack</text>
+  <text x="178" y="226" font-size="15" font-weight="700" fill="#d63031">+</text>
+  <text x="108" y="320" font-size="18" font-weight="700" fill="#2d3436">-</text>
+  <use href="#gnd" x="100" y="325"/>
 
-  <!-- power bus -->
-  <line x1="210" y1="260" x2="262" y2="260" stroke="#d63031" stroke-width="4"/>
-  <line x1="262" y1="130" x2="262" y2="430" stroke="#d63031" stroke-width="4"/>
-  <line x1="262" y1="130" x2="330" y2="130" stroke="#d63031" stroke-width="4"/>
-  <line x1="262" y1="290" x2="330" y2="290" stroke="#d63031" stroke-width="4"/>
-  <line x1="262" y1="430" x2="330" y2="430" stroke="#d63031" stroke-width="4"/>
-  <circle cx="262" cy="260" r="6" fill="#d63031"/>
+  <!-- BAT+ through fuse and gauge to the rail -->
+  <line x1="170" y1="235" x2="200" y2="235" stroke="#d63031" stroke-width="4"/>
+  <rect x="200" y="224" width="50" height="22" rx="4" fill="#fff" stroke="#2d3436" stroke-width="3"/>
+  <text x="225" y="214" text-anchor="middle" font-size="13" fill="#2d3436">fuse</text>
+  <line x1="250" y1="235" x2="280" y2="235" stroke="#d63031" stroke-width="4"/>
+  <rect x="280" y="195" width="140" height="80" rx="12" fill="#f4f4f4" stroke="#7f8c8d" stroke-width="3"/>
+  <text x="350" y="226" text-anchor="middle" font-size="16" font-weight="700" fill="#1e272e">Volt/amp gauge</text>
+  <text x="350" y="247" text-anchor="middle" font-size="13" fill="#2d3436">in series with BAT+:</text>
+  <text x="350" y="265" text-anchor="middle" font-size="13" fill="#2d3436">pack volts and amps</text>
+  <line x1="420" y1="235" x2="450" y2="235" stroke="#d63031" stroke-width="4"/>
 
-  <!-- TP4056 -> ESP32 -->
-  <rect x="330" y="90" width="210" height="80" rx="12" fill="#e8f1ff" stroke="#2f6fed" stroke-width="3"/>
-  <text x="435" y="124" text-anchor="middle" font-size="18" font-weight="700" fill="#1e272e">TP4056 board</text>
-  <text x="435" y="148" text-anchor="middle" font-size="14" fill="#2d3436">charge + boost, 5.0 V out</text>
-  <line x1="540" y1="130" x2="640" y2="130" stroke="#d63031" stroke-width="4" marker-end="url(#arrRed)"/>
-  <text x="590" y="120" text-anchor="middle" font-size="13" fill="#d63031">5 V</text>
+  <!-- BAT+ rail -->
+  <line x1="450" y1="168" x2="450" y2="352" stroke="#d63031" stroke-width="4"/>
+  <circle cx="450" cy="235" r="6" fill="#d63031"/>
+  <line x1="450" y1="168" x2="500" y2="168" stroke="#d63031" stroke-width="4"/>
+  <line x1="450" y1="308" x2="500" y2="308" stroke="#d63031" stroke-width="4"/>
+  <line x1="450" y1="330" x2="450" y2="378" stroke="#d63031" stroke-width="4" marker-end="url(#arrRed)"/>
+  <text x="462" y="372" font-size="13" fill="#d63031">to the divider below</text>
 
-  <rect x="650" y="75" width="260" height="110" rx="14" fill="#eaf8ef" stroke="#00a86b" stroke-width="3"/>
-  <text x="780" y="112" text-anchor="middle" font-size="20" font-weight="700" fill="#1e272e">ESP32-S3 N16R8</text>
-  <text x="780" y="137" text-anchor="middle" font-size="14" fill="#2d3436">5 V pin: power</text>
-  <text x="780" y="160" text-anchor="middle" font-size="14" fill="#2d3436">GPIO 18: battery sense (ADC)</text>
+  <!-- USB charger -> TP4056 board -> ESP32 -->
+  <rect x="510" y="74" width="150" height="30" rx="8" fill="#fff" stroke="#2d3436" stroke-width="2"/>
+  <text x="585" y="94" text-anchor="middle" font-size="14" fill="#1e272e">5 V USB charger</text>
+  <line x1="585" y1="104" x2="585" y2="128" stroke="#d63031" stroke-width="4" marker-end="url(#arrRed)"/>
+  <rect x="500" y="128" width="170" height="80" rx="12" fill="#e8f1ff" stroke="#2f6fed" stroke-width="3"/>
+  <text x="585" y="160" text-anchor="middle" font-size="18" font-weight="700" fill="#1e272e">TP4056 board</text>
+  <text x="585" y="183" text-anchor="middle" font-size="13" fill="#2d3436">charges the cell, 5.0 V out</text>
+  <use href="#gnd" x="585" y="208"/>
+  <line x1="670" y1="168" x2="740" y2="168" stroke="#d63031" stroke-width="4" marker-end="url(#arrRed)"/>
+  <text x="705" y="158" text-anchor="middle" font-size="13" fill="#d63031">5 V</text>
+  <text x="705" y="190" text-anchor="middle" font-size="12" fill="#636e72">0.1-0.2 A</text>
+
+  <rect x="740" y="118" width="190" height="100" rx="14" fill="#eaf8ef" stroke="#00a86b" stroke-width="3"/>
+  <text x="835" y="150" text-anchor="middle" font-size="19" font-weight="700" fill="#1e272e">ESP32-S3 N16R8</text>
+  <text x="835" y="174" text-anchor="middle" font-size="13" fill="#2d3436">5 V pin: power</text>
+  <text x="835" y="195" text-anchor="middle" font-size="13" fill="#2d3436">GPIO 18: battery sense</text>
 
   <!-- XL6009 -> panel -->
-  <rect x="330" y="250" width="210" height="80" rx="12" fill="#e8f1ff" stroke="#2f6fed" stroke-width="3"/>
-  <text x="435" y="284" text-anchor="middle" font-size="18" font-weight="700" fill="#1e272e">XL6009 boost</text>
-  <text x="435" y="308" text-anchor="middle" font-size="14" fill="#2d3436">calibrated 5.0 V, panel only</text>
-  <line x1="540" y1="290" x2="640" y2="290" stroke="#d63031" stroke-width="4" marker-end="url(#arrRed)"/>
-  <text x="590" y="280" text-anchor="middle" font-size="13" fill="#d63031">5 V</text>
+  <rect x="500" y="268" width="170" height="80" rx="12" fill="#e8f1ff" stroke="#2f6fed" stroke-width="3"/>
+  <text x="585" y="300" text-anchor="middle" font-size="18" font-weight="700" fill="#1e272e">XL6009 boost</text>
+  <text x="585" y="323" text-anchor="middle" font-size="13" fill="#2d3436">set to 5.0 V, panel only</text>
+  <use href="#gnd" x="585" y="348"/>
+  <line x1="670" y1="308" x2="740" y2="308" stroke="#d63031" stroke-width="4" marker-end="url(#arrRed)"/>
+  <text x="705" y="298" text-anchor="middle" font-size="13" fill="#d63031">5 V</text>
+  <text x="705" y="330" text-anchor="middle" font-size="12" fill="#636e72">0.8-1.5 A</text>
 
-  <rect x="650" y="235" width="260" height="110" rx="14" fill="#f3ecff" stroke="#8e44ad" stroke-width="3"/>
-  <text x="780" y="272" text-anchor="middle" font-size="20" font-weight="700" fill="#1e272e">P4 80x40 LED panel</text>
-  <text x="780" y="297" text-anchor="middle" font-size="14" fill="#2d3436">screw terminals: power</text>
-  <text x="780" y="320" text-anchor="middle" font-size="14" fill="#2d3436">HUB75 ribbon: data</text>
+  <rect x="740" y="258" width="190" height="100" rx="14" fill="#f3ecff" stroke="#8e44ad" stroke-width="3"/>
+  <text x="835" y="290" text-anchor="middle" font-size="19" font-weight="700" fill="#1e272e">P4 80x40 panel</text>
+  <text x="835" y="314" text-anchor="middle" font-size="13" fill="#2d3436">screw terminals: power</text>
+  <text x="835" y="335" text-anchor="middle" font-size="13" fill="#2d3436">HUB75 ribbon: data</text>
 
-  <!-- common ground -->
-  <line x1="780" y1="185" x2="780" y2="235" stroke="#2d3436" stroke-width="4" stroke-dasharray="8 6"/>
-  <rect x="575" y="193" width="195" height="34" rx="8" fill="#ffecec" stroke="#d63031" stroke-width="2"/>
-  <line x1="770" y1="210" x2="780" y2="210" stroke="#d63031" stroke-width="2"/>
-  <text x="672" y="215" text-anchor="middle" font-size="13" font-weight="700" fill="#d63031">Common GND (required)</text>
+  <!-- common ground between the ESP32 and the panel -->
+  <line x1="835" y1="218" x2="835" y2="258" stroke="#2d3436" stroke-width="4" stroke-dasharray="7 5"/>
+  <text x="846" y="243" font-size="12" font-weight="700" fill="#d63031">common GND</text>
+  <use href="#gnd" x="835" y="358"/>
 
-  <!-- gauge -->
-  <rect x="330" y="395" width="210" height="70" rx="12" fill="#f4f4f4" stroke="#7f8c8d" stroke-width="3"/>
-  <text x="435" y="425" text-anchor="middle" font-size="18" font-weight="700" fill="#1e272e">Volt/amp gauge</text>
-  <text x="435" y="448" text-anchor="middle" font-size="14" fill="#2d3436">pack voltage and current</text>
+  <text x="40" y="408" font-size="13" fill="#636e72">The ESP32, the panel and both boost boards must share ground (the HUB75 ribbon carries it too).</text>
 
-  <!-- divider section -->
-  <line x1="40" y1="505" x2="920" y2="505" stroke="#dfe6e9" stroke-width="2"/>
-  <text x="40" y="540" font-size="20" font-weight="700" fill="#1e272e">Battery voltage divider (telemetry)</text>
+  <!-- ===== DIVIDER AND TELEMETRY ===== -->
+  <line x1="40" y1="430" x2="920" y2="430" stroke="#dfe6e9" stroke-width="2"/>
+  <text x="40" y="464" font-size="20" font-weight="700" fill="#1e272e">Battery voltage divider and telemetry</text>
 
-  <!-- BAT+ to R1 to node to R2 to GND, drawn horizontally -->
-  <text x="40" y="607" font-size="16" font-weight="700" fill="#d63031">BAT+</text>
-  <line x1="95" y1="602" x2="170" y2="602" stroke="#d63031" stroke-width="4"/>
-  <rect x="170" y="584" width="110" height="36" rx="6" fill="#fff" stroke="#2d3436" stroke-width="3"/>
-  <text x="225" y="608" text-anchor="middle" font-size="16" fill="#1e272e">10 kΩ</text>
-  <line x1="280" y1="602" x2="340" y2="602" stroke="#00a86b" stroke-width="4"/>
-  <circle cx="340" cy="602" r="7" fill="#00a86b"/>
-  <line x1="340" y1="602" x2="410" y2="602" stroke="#00a86b" stroke-width="4"/>
-  <rect x="410" y="584" width="110" height="36" rx="6" fill="#fff" stroke="#2d3436" stroke-width="3"/>
-  <text x="465" y="608" text-anchor="middle" font-size="16" fill="#1e272e">10 kΩ</text>
-  <line x1="520" y1="602" x2="580" y2="602" stroke="#2d3436" stroke-width="4"/>
-  <text x="590" y="608" font-size="16" font-weight="700" fill="#2d3436">GND</text>
+  <text x="40" y="531" font-size="16" font-weight="700" fill="#d63031">BAT+</text>
+  <line x1="95" y1="526" x2="170" y2="526" stroke="#d63031" stroke-width="4"/>
+  <rect x="170" y="508" width="110" height="36" rx="6" fill="#fff" stroke="#2d3436" stroke-width="3"/>
+  <text x="225" y="532" text-anchor="middle" font-size="16" fill="#1e272e">10 kΩ</text>
+  <line x1="280" y1="526" x2="410" y2="526" stroke="#00a86b" stroke-width="4"/>
+  <circle cx="340" cy="526" r="7" fill="#00a86b"/>
+  <rect x="410" y="508" width="110" height="36" rx="6" fill="#fff" stroke="#2d3436" stroke-width="3"/>
+  <text x="465" y="532" text-anchor="middle" font-size="16" fill="#1e272e">10 kΩ</text>
+  <line x1="520" y1="526" x2="560" y2="526" stroke="#2d3436" stroke-width="4"/>
+  <line x1="560" y1="526" x2="560" y2="540" stroke="#2d3436" stroke-width="3"/>
+  <use href="#gnd" x="560" y="534"/>
+  <text x="580" y="531" font-size="16" font-weight="700" fill="#2d3436">GND</text>
+  <text x="352" y="498" font-size="13" fill="#2d3436">midpoint = half the cell voltage (1.7 - 2.1 V)</text>
 
-  <line x1="340" y1="602" x2="340" y2="660" stroke="#00a86b" stroke-width="4"/>
-  <line x1="340" y1="660" x2="640" y2="660" stroke="#00a86b" stroke-width="4" marker-end="url(#arrGreen)"/>
-  <rect x="650" y="636" width="260" height="48" rx="10" fill="#eaf8ef" stroke="#00a86b" stroke-width="3"/>
-  <text x="780" y="666" text-anchor="middle" font-size="16" font-weight="700" fill="#1e272e">ESP32-S3 GPIO 18 (ADC)</text>
-  <text x="352" y="650" font-size="13" fill="#2d3436">midpoint = half the battery voltage</text>
-  <text x="40" y="705" font-size="13" fill="#636e72">The firmware doubles the reading and maps 3.4 V (0%) to 4.2 V (100%) in a straight line.</text>
+  <!-- midpoint -> first telemetry step -->
+  <polyline points="340,526 340,572 115,572 115,598" fill="none" stroke="#00a86b" stroke-width="4" marker-end="url(#arrGreen)"/>
+
+  <!-- telemetry chain -->
+  <g stroke-width="3">
+    <rect x="40" y="600" width="150" height="92" rx="12" fill="#eaf8ef" stroke="#00a86b"/>
+    <rect x="222" y="600" width="150" height="92" rx="12" fill="#fff" stroke="#7f8c8d"/>
+    <rect x="404" y="600" width="150" height="92" rx="12" fill="#fff" stroke="#7f8c8d"/>
+    <rect x="586" y="600" width="150" height="92" rx="12" fill="#e8f1ff" stroke="#2f6fed"/>
+    <rect x="768" y="600" width="150" height="92" rx="12" fill="#f3ecff" stroke="#8e44ad"/>
+  </g>
+  <g text-anchor="middle" fill="#2d3436" font-size="13">
+    <text x="115" y="626" font-size="15" font-weight="700" fill="#1e272e">GPIO 18 (ADC)</text><text x="115" y="650">reading, average</text><text x="115" y="668">of 10 samples</text>
+    <text x="297" y="626" font-size="15" font-weight="700" fill="#1e272e">Double it</text><text x="297" y="650">the divider halves</text><text x="297" y="668">the voltage</text>
+    <text x="479" y="626" font-size="15" font-weight="700" fill="#1e272e">Map to percent</text><text x="479" y="650">3.4 V = 0 %</text><text x="479" y="668">4.2 V = 100 %</text>
+    <text x="661" y="626" font-size="15" font-weight="700" fill="#1e272e">Telemetry packet</text><text x="661" y="650">byte 4: 0-100 %</text><text x="661" y="668">flag bit 0: below 15 %</text>
+    <text x="843" y="626" font-size="15" font-weight="700" fill="#1e272e">Phone app</text><text x="843" y="650">battery icon, red</text><text x="843" y="668">below 15 %</text>
+  </g>
+  <g stroke="#00a86b" stroke-width="4">
+    <line x1="190" y1="646" x2="220" y2="646" marker-end="url(#arrGreen)"/>
+    <line x1="372" y1="646" x2="402" y2="646" marker-end="url(#arrGreen)"/>
+    <line x1="554" y1="646" x2="584" y2="646" marker-end="url(#arrGreen)"/>
+    <line x1="736" y1="646" x2="766" y2="646" marker-end="url(#arrGreen)"/>
+  </g>
+  <text x="661" y="712" text-anchor="middle" font-size="13" fill="#2d3436">sent over Bluetooth every 2 s</text>
+
+  <text x="40" y="746" font-size="13" fill="#636e72">The divider always draws about 0.2 mA from the cell (4.2 V / 20 kΩ), even when the board is off.</text>
+  <text x="40" y="768" font-size="13" fill="#636e72">The reading is taken under load, so the percentage dips while the panel draws current: a rough gauge, not a fuel meter.</text>
 </svg>
