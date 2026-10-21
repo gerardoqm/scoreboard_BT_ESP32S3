@@ -113,7 +113,7 @@ Panel behavior:
 | 3 | Period | |
 | 4 | Battery % | 0-100 |
 | 5 | Flags | bit 0 = battery below 15%, bit 1 = a new name is staged |
-| 6 | Protocol version | currently `8`; the app uses it only to know which commands the board understands |
+| 6 | Protocol version | currently `9`; the app uses it only to know which commands the board understands |
 | 7-9 | Firmware version | major, minor, patch (for example `1`, `0`, `0` is version 1.0.0); absent on firmware older than 1.0.0 |
 
 The app shows "firmware outdated" when it receives a shorter packet or a lower version than it expects. Bump `PROTOCOL_VERSION` in the sketch and `expectedProtocolVersion` in the app together whenever a layout changes.
@@ -127,8 +127,11 @@ Write `[command, args...]` to the config characteristic; each command is answere
 | `0x01` Set name | `01` + 1-20 printable ASCII bytes | Stages the name; nothing is saved yet |
 | `0x02` Apply | `02` | Saves the staged name to flash and reboots |
 | `0x03` Set colors | `03` + 9 x RGB565 (2 bytes each, big-endian) | Sets the color of each piece of panel text and saves them to flash. Order: timer running, timer stopped, period, home name, home score, away name, away score, game start alert, period start alert |
-| `0x04` Alert | `04`, type (`1` game start, `2` period start), 1-32 ASCII characters (16 before protocol 8) | Plays the alert: the text scrolls across the whole panel at 3x in the alert's color while the border flashes, then the scoreboard returns |
+| `0x04` Alert | `04`, type (`1` game start, `2` period start, `3` goal), 1-32 ASCII characters (16 before protocol 8) | Plays the alert: the text scrolls across the whole panel at 3x in the alert's color while the border flashes, then the scoreboard returns |
 | `0x05` Set visibility | `05` + 2 bytes, little-endian bitmask | Bit i set shows element i, in the same order as the colors (timer running, timer stopped, period, home name, home score, away name, away score, game start alert, period start alert). The timer uses the running bit for both states. A cleared alert bit means that alert does not play. Saved to flash |
+| `0x06` Alert icon | `06`, first row (0-15) + 1-4 rows of 16 pixels (RGB565, big-endian, 32 bytes per row); `06` alone removes it | Loads the 16x16 picture that the goal alert (`04` type `3`) scrolls in front of its text |
+| `0x07` Name icon | `07`, slot (0-3), first row (0-9) + 1-5 rows of 10 pixels (RGB565, big-endian, 20 bytes per row); `07`, slot alone clears it | Loads a 10x10 emoji picture. A team name (and a goal alert) shows picture N where it holds the byte N: slots 0-1 are the home name, 2-3 the away name |
+| `0x08` End text | `08` + 1-32 ASCII characters | The text the board scrolls by itself when the last period runs out (protocol 9). The app sends it in its language |
 
 ### Connection states
 After the first state packet of a session, an unexpected disconnect starts a 30 second cyan "retrying" window for the same phone. If no state was received yet, or the window expires, the board returns to blue "searching" and resets the display.
