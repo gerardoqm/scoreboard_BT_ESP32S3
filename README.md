@@ -27,15 +27,21 @@ Connect your 16-pin HUB75 display ribbon cable over to your ESP32-S3 development
 | Pin 5 | **R2** (Bottom Red Data) | **GPIO 4** |
 | Pin 6 | **G2** (Bottom Green Data) | **GPIO 5** |
 | Pin 7 | **B2** (Bottom Blue Data) | **GPIO 6** |
+| Pin 8 | **E** (5th Row Select Line) | **GPIO 11** |
 | Pin 9 | **A** (Row Select Line A) | **GPIO 7** |
 | Pin 10 | **B** (Row Select Line B) | **GPIO 8** |
 | Pin 11 | **C** (Row Select Line C) | **GPIO 9** |
 | Pin 12 | **D** (Row Select Line D) | **GPIO 10** |
-| Pin 16 | **E** (5th Row Select Line) | **GPIO 11** |
 | Pin 14 | **LAT / STB** (Latch Data) | **GPIO 12** |
 | Pin 15 | **OE** (Output Enable) | **GPIO 13** |
 | Pin 13 | **CLK** (Clock Signal) | **GPIO 14** |
-| Pins 4, 8, 20 | **GND** (Ground Reference) | **Any Board GND Pin** |
+| Pins 4, 16 | **GND** (Ground Reference) | **Any Board GND Pin** |
+
+> The pin numbers follow the labels printed on the panel's input socket (`JIN`): the left column reads R1, B1, R2, B2, A, C, CLK, OE and the right column G1, GND, G2, **E**, B, D, LAT, **GND**, top to bottom. E is on pin 8 and ground on pins 4 and 16. Check the printed labels on your own panel before wiring: panels differ.
+
+### Panel power connector
+
+The panel's power input is a 4-pin header labelled `POWER`: two `VCC` and two `GND` pins. Connect both VCC pins to the 5 V from the XL6009 and both GND pins to its ground, so the current (up to about 1.5 A) is shared.
 
 ### Onboard Status Indicator
 - **Onboard WS2812B RGB NeoPixel:** Driven natively on **GPIO 48**.
@@ -51,9 +57,13 @@ To prevent flash memory restriction errors (`[Errno 32] Broken Pipe`), apply the
 - **Board:** `ESP32S3 Dev Module`
 - **Flash Size:** `16MB (128Mb)`
 - **Partition Scheme:** `16MB Flash (2MB APP/12.5MB FATFS)`
-- **PSRAM:** `OPI PSRAM`
+- **PSRAM:** `Disabled` (the firmware does not use PSRAM. With `OPI PSRAM` selected, a board whose PSRAM is faulty restarts in a loop at power-up and never runs the sketch)
 - **Upload Mode:** `UART0 / Hardware CDC`
 - **USB CDC On Boot:** `Enabled`
+
+### Panel colors wrong or the display blank?
+
+`tools/panel-test/panel-test.ino` is a small sketch that shows four colour bands (red, green, blue, white) and repeats them for each driver chip type the display library supports, so you can see which one your panel needs. Its header explains how to read the result. If the board restarts in a loop and never starts, build with **PSRAM: Disabled**.
 
 ### Network Credentials & OTA Setup
 Wi-Fi and OTA credentials are kept out of the sketch in a **gitignored** `secrets.h`:

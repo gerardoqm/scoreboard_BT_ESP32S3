@@ -74,7 +74,7 @@
 
   <rect x="740" y="258" width="190" height="100" rx="14" fill="#f3ecff" stroke="#8e44ad" stroke-width="3"/>
   <text x="835" y="290" text-anchor="middle" font-size="19" font-weight="700" fill="#1e272e">P4 80x40 panel</text>
-  <text x="835" y="314" text-anchor="middle" font-size="13" fill="#2d3436">screw terminals: power</text>
+  <text x="835" y="314" text-anchor="middle" font-size="13" fill="#2d3436">4-pin POWER header: 2 VCC, 2 GND</text>
   <text x="835" y="335" text-anchor="middle" font-size="13" fill="#2d3436">HUB75 ribbon: data</text>
 
   <!-- common ground between the ESP32 and the panel -->
