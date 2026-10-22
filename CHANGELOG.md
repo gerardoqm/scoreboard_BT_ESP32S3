@@ -2,7 +2,13 @@
 
 Versions follow `major.minor.patch` (see the Versions section of the README).
 
-## 1.2.2 (not released)
+## 1.3.0 (not released)
+- The board announces the end of the match by itself: when the clock reaches zero in the last period it scrolls the text the app sent with the new `CMD_END_TEXT` ("FULL TIME" until then), even if the phone is gone. An identical alert from the phone a moment later does not restart it. Protocol version 9.
+
+## 1.2.3
+- Alert text can be up to 32 characters (was 16), so a goal alert fits a long team name. Protocol version 8.
+
+## 1.2.2
 - A goal alert can carry the scoring team's emoji (the same bytes 1-4 as the names): it is drawn 15 x 15 inside the scrolling text.
 
 ## 1.2.1

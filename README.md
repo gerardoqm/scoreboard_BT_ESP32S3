@@ -12,7 +12,7 @@ This repository contains the resilient, optimized C++ firmware required to trans
   - *Searching:* Onboard RGB NeoPixel blinks **Solid Blue**.
   - *Connected:* Transitions cleanly to **Solid Green**.
   - *Accidental Dropout:* Blinks **Cyan (Blue/Green Mix)** for 30 seconds while waiting to catch its previous companion phone. If the 30-second window expires, it wipes its display to zero parameters and opens the airwaves for a clean connection.
-- **Analog Battery Monitoring:** Continuously samples raw analog cell voltages through an optimized 10-sample rolling average function on **GPIO 18**, scaling the cell voltage linearly from 3.4 V (0%) to 4.2 V (100%) and sending it in the BLE telemetry notification. The divider halves the voltage, so the firmware doubles the reading.
+- **Analog Battery Monitoring:** Continuously samples raw analog cell voltages through a 10-sample average on **GPIO 18**, scaling the cell voltage linearly from 3.4 V (0%) to 4.2 V (100%) and sending it in the BLE telemetry notification. The divider halves the voltage, so the firmware doubles the reading.
 - **Silent Network IDE OTA Programming:** Runs a background `ArduinoOTA` server. After the initial wire flash, your board registers wirelessly inside your Arduino IDE as a **Network Port**, allowing you to update the board over Wi-Fi without un-boxing the enclosure housing.
 
 ## 🔌 Hardware Pin Mapping Blueprint
@@ -41,7 +41,8 @@ Connect your 16-pin HUB75 display ribbon cable over to your ESP32-S3 development
 - **Onboard WS2812B RGB NeoPixel:** Driven natively on **GPIO 48**.
 
 ### Resistor Divider Telemetry (Battery Tracker)
-- Solder two matching **10kΩ resistors** in series between your raw battery positive (`BAT+`) and Ground (`GND`). Tap a wire from the middle junction point directly to **GPIO 18**.
+- Solder two matching **10kΩ resistors** in series between your raw battery positive (`BAT+`, taken after the fuse) and Ground (`GND`). Tap a wire from the middle junction point directly to **GPIO 18**.
+- The junction sits at half the cell voltage: 1.7 V (empty, 3.4 V) to 2.1 V (full, 4.2 V), safely inside the ADC range. Never connect `BAT+` straight to the pin.
 
 ## ⚙️ Arduino IDE Compilation Configuration
 
@@ -112,7 +113,7 @@ Panel behavior:
 | 3 | Period | |
 | 4 | Battery % | 0-100 |
 | 5 | Flags | bit 0 = battery below 15%, bit 1 = a new name is staged |
-| 6 | Protocol version | currently `5`; the app uses it only to know which commands the board understands |
+| 6 | Protocol version | currently `9`; the app uses it only to know which commands the board understands |
 | 7-9 | Firmware version | major, minor, patch (for example `1`, `0`, `0` is version 1.0.0); absent on firmware older than 1.0.0 |
 
 The app shows "firmware outdated" when it receives a shorter packet or a lower version than it expects. Bump `PROTOCOL_VERSION` in the sketch and `expectedProtocolVersion` in the app together whenever a layout changes.
@@ -126,8 +127,11 @@ Write `[command, args...]` to the config characteristic; each command is answere
 | `0x01` Set name | `01` + 1-20 printable ASCII bytes | Stages the name; nothing is saved yet |
 | `0x02` Apply | `02` | Saves the staged name to flash and reboots |
 | `0x03` Set colors | `03` + 9 x RGB565 (2 bytes each, big-endian) | Sets the color of each piece of panel text and saves them to flash. Order: timer running, timer stopped, period, home name, home score, away name, away score, game start alert, period start alert |
-| `0x04` Alert | `04`, type (`1` game start, `2` period start), 1-16 ASCII characters | Plays the alert: the text scrolls across the whole panel at 3x in the alert's color while the border flashes, then the scoreboard returns |
+| `0x04` Alert | `04`, type (`1` game start, `2` period start, `3` goal), 1-32 ASCII characters (16 before protocol 8) | Plays the alert: the text scrolls across the whole panel at 3x in the alert's color while the border flashes, then the scoreboard returns |
 | `0x05` Set visibility | `05` + 2 bytes, little-endian bitmask | Bit i set shows element i, in the same order as the colors (timer running, timer stopped, period, home name, home score, away name, away score, game start alert, period start alert). The timer uses the running bit for both states. A cleared alert bit means that alert does not play. Saved to flash |
+| `0x06` Alert icon | `06`, first row (0-15) + 1-4 rows of 16 pixels (RGB565, big-endian, 32 bytes per row); `06` alone removes it | Loads the 16x16 picture that the goal alert (`04` type `3`) scrolls in front of its text |
+| `0x07` Name icon | `07`, slot (0-3), first row (0-9) + 1-5 rows of 10 pixels (RGB565, big-endian, 20 bytes per row); `07`, slot alone clears it | Loads a 10x10 emoji picture. A team name (and a goal alert) shows picture N where it holds the byte N: slots 0-1 are the home name, 2-3 the away name |
+| `0x08` End text | `08` + 1-32 ASCII characters | The text the board scrolls by itself when the last period runs out (protocol 9). The app sends it in its language |
 
 ### Connection states
 After the first state packet of a session, an unexpected disconnect starts a 30 second cyan "retrying" window for the same phone. If no state was received yet, or the window expires, the board returns to blue "searching" and resets the display.
@@ -136,7 +140,20 @@ After the first state packet of a session, an unexpected disconnect starts a 30 
 
 ### Power and battery telemetry
 
-<p align="center"><img src="docs/power-blueprint.svg" alt="Power diagram: LiPo cell feeding the TP4056 board for the ESP32-S3, the XL6009 boost for the LED panel, a volt/amp gauge, and the 10k resistor divider on GPIO 18" width="760"></p>
+<p align="center"><img src="docs/power-blueprint.svg" alt="Power diagram: the LiPo cell feeds, through a fuse and the volt/amp gauge, the TP4056 board (5 V for the ESP32-S3) and the XL6009 boost (5 V for the LED panel); all grounds are joined; a 10k + 10k divider on GPIO 18 measures the cell and the reading travels in the Bluetooth telemetry to the app" width="760"></p>
+
+How the battery percentage is made:
+
+1. The two 10 kΩ resistors halve the cell voltage, and the ESP32-S3 reads the midpoint on **GPIO 18** (12-bit ADC).
+2. The firmware averages 10 readings, doubles the result and maps **3.4 V to 0 %** and **4.2 V to 100 %** in a straight line.
+3. The percentage goes out as byte 4 of the telemetry notification every 2 seconds, and the app shows it as the battery icon next to the unit name (red below 15 %, which is also flag bit 0).
+
+Good to know:
+
+- **The divider never switches off.** It draws about 0.2 mA from the cell (4.2 V / 20 kΩ), roughly 5 mAh a day, even when the board is off. Disconnect the pack for long storage.
+- **The reading is taken under load.** The cell voltage sags while the panel draws 1 - 2 A, so the percentage dips during a game and recovers when the load drops.
+- **GPIO 18 is on the ADC2 unit.** Espressif documents that ADC2 readings can fail while Wi-Fi is running (see the [ESP32-S3 ADC notes](https://docs.espressif.com/projects/esp-idf/en/v4.4.5/esp32s3/api-reference/peripherals/adc.html)), and this firmware keeps Wi-Fi on for wireless uploads. If the percentage ever sticks at 0 % or 100 %, that is the first thing to suspect. GPIO 1 - 10 (the ADC1 unit) are all taken by the HUB75 wiring.
+- **The gauge goes in series.** Put the volt/amp gauge in line with `BAT+` so its current reading covers everything the cell feeds.
 
 ### HUB75 connector
 
