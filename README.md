@@ -41,13 +41,13 @@ Connect your 16-pin HUB75 display ribbon cable over to your ESP32-S3 development
 
 ### Panel power connector
 
-The panel's power input is a 4-pin header labelled `POWER`: two `VCC` and two `GND` pins. Connect both VCC pins to the 5 V from the XL6009 and both GND pins to its ground, so the current (up to about 1.5 A) is shared.
+The panel's power input is a 4-pin header labelled `POWER`: two `VCC` and two `GND` pins. Connect both VCC pins to the 5 V from the XL6009 and both GND pins to its ground, so the current (up to about 1.5 A) is shared. Power it only from the XL6009: a small charge or power-bank board cannot carry it.
 
 ### Onboard Status Indicator
 - **Onboard WS2812B RGB NeoPixel:** Driven natively on **GPIO 48**.
 
 ### Resistor Divider Telemetry (Battery Tracker)
-- Solder two matching **10kΩ resistors** in series between your raw battery positive (`BAT+`, taken after the fuse) and Ground (`GND`). Tap a wire from the middle junction point directly to **GPIO 18**.
+- Solder two matching **10kΩ resistors** in series between the battery positive **after the switch** (`BAT+`) and Ground (`GND`). Tap a wire from the middle junction point directly to **GPIO 18**.
 - The junction sits at half the cell voltage: 1.7 V (empty, 3.4 V) to 2.1 V (full, 4.2 V), safely inside the ADC range. Never connect `BAT+` straight to the pin.
 
 ## ⚙️ Arduino IDE Compilation Configuration
@@ -150,7 +150,7 @@ After the first state packet of a session, an unexpected disconnect starts a 30 
 
 ### Power and battery telemetry
 
-<p align="center"><img src="docs/power-blueprint.svg" alt="Power diagram: the LiPo cell feeds, through a fuse and the volt/amp gauge, the TP4056 board (5 V for the ESP32-S3) and the XL6009 boost (5 V for the LED panel); all grounds are joined; a 10k + 10k divider on GPIO 18 measures the cell and the reading travels in the Bluetooth telemetry to the app" width="760"></p>
+<p align="center"><img src="docs/power-blueprint.svg" alt="Power diagram: the LiPo cell feeds, through a 5 A fuse, a switch rated 10 A or more and an optional volt/amp gauge, the XL6009 boost, whose 5 V powers the LED panel and the ESP32-S3; a charge board (TP4056) is connected to the cell only and is not in the load path; all grounds are joined; a 10k + 10k divider after the switch feeds GPIO 18 and the reading travels in the Bluetooth telemetry to the app" width="760"></p>
 
 How the battery percentage is made:
 
@@ -160,7 +160,7 @@ How the battery percentage is made:
 
 Good to know:
 
-- **The divider never switches off.** It draws about 0.2 mA from the cell (4.2 V / 20 kΩ), roughly 5 mAh a day, even when the board is off. Disconnect the pack for long storage.
+- **The divider is after the switch.** It draws about 0.2 mA from the cell (4.2 V / 20 kΩ) only while the scoreboard is switched on, so a cell left switched off is not drained by it.
 - **The reading is taken under load.** The cell voltage sags while the panel draws 1 - 2 A, so the percentage dips during a game and recovers when the load drops.
 - **GPIO 18 is on the ADC2 unit.** Espressif documents that ADC2 readings can fail while Wi-Fi is running (see the [ESP32-S3 ADC notes](https://docs.espressif.com/projects/esp-idf/en/v4.4.5/esp32s3/api-reference/peripherals/adc.html)), and this firmware keeps Wi-Fi on for wireless uploads. If the percentage ever sticks at 0 % or 100 %, that is the first thing to suspect. GPIO 1 - 10 (the ADC1 unit) are all taken by the HUB75 wiring.
 - **The gauge goes in series.** Put the volt/amp gauge in line with `BAT+` so its current reading covers everything the cell feeds.
@@ -231,7 +231,7 @@ capacity needed (Ah) = average current (A) x hours wanted / 0.8
 
 ### Things to watch
 
-- **Use a protected pack** (or a BMS) and put a fuse close to the battery. Do not use bare, unprotected LiPo cells.
-- **Charging is slow.** The TP4056 charges at 1 A at most, so a 10 Ah pack needs 10 hours or more. For packs above about 6 Ah, consider a faster charger.
-- **The XL6009 that feeds the panel** is rated for 4 A of switch current. At 3.7 V in, a 1.5 A panel load already needs about 2.4 A from the battery, so expect it to get warm and check that the panel does not spike above that at full white.
+- **Use a protected pack** (or a BMS) and put a **5 A fuse** on the battery positive wire, as close to the cell as you can, followed by a **switch rated 10 A or more**. A small slide switch (a few hundred mA) will overheat. Use wire of 20 AWG or thicker between the cell and the XL6009. Do not use bare, unprotected LiPo cells.
+- **Charge with the load off, through a charge board that is not in the load path.** Connect the charge board (TP4056) to the cell terminals only and take the scoreboard's power from the cell through the fuse, the switch and the XL6009. If the panel's current passes through a small charge or power-bank board, that board overheats and the 5 V sags, which first kills the green and blue LEDs. The TP4056 charges at 1 A at most and gets warm doing it, so a 10 Ah pack needs 10 hours or more; for packs above about 6 Ah, consider a faster charger with better cooling.
+- **The XL6009** is rated for 4 A of switch current. It is a step-up converter: feed it from the **battery** (3.0 - 4.2 V), never from a 5 V output, and set its output to 5.0 V with no load before you connect the panel and the ESP32. At 3.7 V in, a 1.5 A panel load already needs about 2.4 A from the battery, so expect it to get warm and check that the panel does not spike above that at full white.
 - **The battery percentage is approximate.** The firmware scales 3.4 V (0%) to 4.2 V (100%) in a straight line, while a real LiPo discharge curve is not linear. Use it as a rough gauge, not a fuel meter.

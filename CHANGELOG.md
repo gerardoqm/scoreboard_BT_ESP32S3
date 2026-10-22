@@ -3,6 +3,7 @@
 Versions follow `major.minor.patch` (see the Versions section of the README).
 
 ## Documentation fix
+- Power: the diagram and the text now show a 5 A fuse and a 10 A switch in the load path, the charge board off the load path, the XL6009 fed from the battery (it feeds both the panel and the ESP32), and the voltage divider after the switch. A power-bank style board in the load path overheated and made the 5 V sag, which killed the green and blue LEDs first.
 - Build setting: **PSRAM is now Disabled** in the documented compilation settings. The firmware never uses PSRAM, and with `OPI PSRAM` selected a board with a faulty PSRAM restarted in a loop at power-up (reset reason RTCWDT), whatever sketch it ran.
 - New `tools/panel-test` sketch: colour bands repeated for each panel driver chip type, to diagnose wrong or missing colours.
 - The HUB75 pinout was wrong for E and ground: E is on socket pin 8 and ground on pins 4 and 16 (as printed on the panel, `JIN`), not E on 16 and ground on 8. The diagram and the pin table are corrected, and the panel's 4-pin power header (2 VCC, 2 GND) is described. No firmware change: the GPIO numbers were right.
