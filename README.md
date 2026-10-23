@@ -13,7 +13,7 @@ This repository contains the resilient, optimized C++ firmware required to trans
   - *Connected:* Transitions cleanly to **Solid Green**.
   - *Accidental Dropout:* Blinks **Cyan (Blue/Green Mix)** for 30 seconds while waiting to catch its previous companion phone. If the 30-second window expires, it wipes its display to zero parameters and opens the airwaves for a clean connection.
 - **Analog Battery Monitoring:** Continuously samples raw analog cell voltages through a 10-sample average on **GPIO 18**, scaling the cell voltage linearly from 3.4 V (0%) to 4.2 V (100%) and sending it in the BLE telemetry notification. The divider halves the voltage, so the firmware doubles the reading.
-- **Silent Network IDE OTA Programming:** Runs a background `ArduinoOTA` server. After the initial wire flash, your board registers wirelessly inside your Arduino IDE as a **Network Port**, allowing you to update the board over Wi-Fi without un-boxing the enclosure housing.
+- **Bluetooth firmware updates:** After the first USB flash, the board is updated from the phone app over Bluetooth (see "Updating over Bluetooth"). The board has no Wi-Fi network connection.
 
 ## 🔌 Hardware Pin Mapping Blueprint
 
@@ -65,12 +65,12 @@ To prevent flash memory restriction errors (`[Errno 32] Broken Pipe`), apply the
 
 `tools/panel-test/panel-test.ino` is a small sketch that shows four colour bands (red, green, blue, white) and repeats them for each driver chip type the display library supports, so you can see which one your panel needs. Its header explains how to read the result. If the board restarts in a loop and never starts, build with **PSRAM: Disabled**.
 
-### Network Credentials & OTA Setup
-Wi-Fi and OTA credentials are kept out of the sketch in a **gitignored** `secrets.h`:
+### Update key setup
+The Bluetooth update key is kept out of the sketch in a **gitignored** `secrets.h`:
 
 1. Copy `secrets.h.example` to `secrets.h` (same folder as the `.ino`).
-2. Fill in `WIFI_SSID`, `WIFI_PASSWORD` and choose your own `OTA_PASSWORD`.
-3. Flash once over USB-C. Afterwards pick the board under **Tools > Port > Network Ports** and enter your OTA password to update wirelessly.
+2. Choose your own `OTA_PASSWORD`.
+3. Flash once over USB-C. Afterwards update from the phone app over Bluetooth.
 
 `secrets.h` is listed in `.gitignore`; never commit it.
 
@@ -162,7 +162,7 @@ Good to know:
 
 - **The divider is after the switch.** It draws about 0.2 mA from the cell (4.2 V / 20 kΩ) only while the scoreboard is switched on, so a cell left switched off is not drained by it.
 - **The reading is taken under load.** The cell voltage sags while the panel draws 1 - 2 A, so the percentage dips during a game and recovers when the load drops.
-- **GPIO 18 is on the ADC2 unit.** Espressif documents that ADC2 readings can fail while Wi-Fi is running (see the [ESP32-S3 ADC notes](https://docs.espressif.com/projects/esp-idf/en/v4.4.5/esp32s3/api-reference/peripherals/adc.html)), and this firmware keeps Wi-Fi on for wireless uploads. If the percentage ever sticks at 0 % or 100 %, that is the first thing to suspect. GPIO 1 - 10 (the ADC1 unit) are all taken by the HUB75 wiring.
+- **GPIO 18 is on the ADC2 unit.** Espressif documents that ADC2 readings can fail while the Wi-Fi radio is running (see the [ESP32-S3 ADC notes](https://docs.espressif.com/projects/esp-idf/en/v4.4.5/esp32s3/api-reference/peripherals/adc.html)); this firmware only runs it for the board-to-board mirror. If the percentage ever sticks at 0 % or 100 %, that is the first thing to suspect. GPIO 1 - 10 (the ADC1 unit) are all taken by the HUB75 wiring.
 - **The gauge goes in series.** Put the volt/amp gauge in line with `BAT+` so its current reading covers everything the cell feeds.
 
 ### HUB75 connector
@@ -178,10 +178,10 @@ The firmware has a version number, `major.minor.patch`, set by `FW_VERSION_MAJOR
 
 After the first USB flash of a version that includes it, the board can be updated from the phone: open **Board Firmware** in the app and tap **Update board firmware**. The panel shows a progress bar and the board restarts when it is done.
 
-- The app carries the firmware image. Build it with `tools/bundle-firmware.sh` in the app repository; the script also writes the update key from `secrets.h` next to the image, so nobody types a password. That folder is git-ignored because the image contains your Wi-Fi and update passwords. Never commit it.
+- The app carries the firmware image. Build it with `tools/bundle-firmware.sh` in the app repository; the script also writes the update key from `secrets.h` next to the image, so nobody types a password. That folder is git-ignored because it contains your update password. Never commit it.
 - The board only accepts a transfer after the app answers a random challenge (HMAC-SHA256 of a nonce with `OTA_PASSWORD`); three wrong answers lock it for 30 seconds.
 - The image is written to the spare firmware slot, checked with a CRC-32, and only then does the board switch to it. If anything fails the board keeps its current firmware. There is no automatic rollback if a new image crashes right after starting; a USB flash fixes that.
-- Wi-Fi and USB updates keep working.
+- USB updates keep working. Wireless (Wi-Fi) updates were removed in 1.4.1.
 
 OTA characteristic `87654321-4321-4321-4321-210987654323` (write, write without response, notify). Messages from the phone start with an opcode; replies are notifications `[opcode, status, ...]`:
 

@@ -6,7 +6,8 @@
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
 #include <WiFi.h>
-#include <ArduinoOTA.h> 
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include <Update.h>
 #include <esp_random.h>
 #include "mbedtls/md.h"
@@ -18,7 +19,7 @@
 MatrixPanel_I2S_DMA *dma_display = nullptr;
 Preferences prefs;
 
-// Wi-Fi and OTA credentials live in secrets.h (gitignored). Copy secrets.h.example to create it.
+// The Bluetooth update key (OTA_PASSWORD) lives in secrets.h (gitignored). Copy secrets.h.example to create it.
 #include "secrets.h"
 
 // Safe Exposed ESP32-S3 HUB75 GPIO Pins
@@ -58,6 +59,8 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 #define CMD_NAME_ICON  0x07 // args: slot (0-3), first row (0-9) + 1-5 rows of 10 pixels, RGB565 big-endian (20 bytes per row); slot alone = clear it
                             // A team name shows icon N (1-4) where it holds the byte N: slots 0-1 for the home name, 2-3 for the away name.
 #define CMD_END_TEXT   0x08 // args: 1-32 ASCII characters: what the board scrolls by itself when the last period runs out (the app sends it in its language)
+#define CMD_MIRROR     0x09 // args: 1 = look for a second board (60 s), 2 = stop looking, 3 = unlink the second board. The second board mirrors this one over ESP-NOW.
+                            // Link the second board by holding its BOOT button for 2 s while the first one is looking. Hold BOOT for 6 s to unlink from the second board.
 // Firmware update over Bluetooth: own characteristic. Phone -> board writes start with an opcode; replies are
 // notifications [opcode, status, ...]. Data chunks are written without response and acknowledged every 4 KB.
 #define OTA_UUID           "87654321-4321-4321-4321-210987654323"
@@ -99,16 +102,21 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // v7 adds CMD_NAME_ICON: emoji pictures inside team names.
 // v8 raises the alert text limit from 16 to 32 characters (long team names in goal alerts).
 // v9 adds CMD_END_TEXT and the board announces the end of the match by itself.
+// v10 adds CMD_MIRROR: a second board shows the same scoreboard, linked board to board with ESP-NOW. Telemetry gets a byte 10 (second board's battery).
 // v5 adds firmware updates over Bluetooth (OTA characteristic) and the firmware version as bytes 7-9 of the telemetry (10 bytes).
-#define PROTOCOL_VERSION 9
+#define PROTOCOL_VERSION 10
 // Firmware version, semantic: bump PATCH for fixes, MINOR for features that stay compatible, MAJOR for breaking changes.
 // Sent in the telemetry (bytes 7-9) so the app can show it and compare it with the image bundled in the app.
 // PROTOCOL_VERSION above is only for the app's feature checks; the version below is what people see.
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 3
-#define FW_VERSION_PATCH 0
+#define FW_VERSION_MINOR 4
+#define FW_VERSION_PATCH 1
 #define FLAG_LOW_BATTERY    0x01  // battery below 15%
 #define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
+#define FLAG_MIRROR_SOURCE  0x04  // this board feeds a second board
+#define FLAG_MIRROR_ONLINE  0x08  // ... and that board answered in the last few seconds
+#define FLAG_MIRROR_FOLLOWER 0x10 // this board follows another board instead of the phone
+#define FLAG_MIRROR_PAIRING 0x20  // looking for a second board
 
 // Panel layout (80x40), 3x5 pixel font: timer (left) and period (right) at 2x on top, scores at 3x in the
 // middle, team names at 2x along the bottom. No frame.
@@ -298,13 +306,20 @@ bool marqueeStep(Marquee &m) {
   return true;
 }
 
+// GPIO18 is on ADC2, which cannot be read while the radio is busy (ESP-NOW, Wi-Fi): a failed read comes back as 0.
+// Failed samples are ignored; with none left the last good value stands, and batteryKnown tells whether there ever was one.
+static bool batteryKnown = false;
+static int lastGoodBatteryPct = 0;
 int readBatteryPercentage() {
-  long rawSum = 0;
-  for(int i = 0; i < 10; i++) { rawSum += analogRead(BATTERY_ADC_PIN); delay(2); }
-  float analogVolts = (rawSum / 10.0) * (3.3 / 4095.0);
+  long rawSum = 0; int good = 0;
+  for(int i = 0; i < 16; i++) { int v = analogRead(BATTERY_ADC_PIN); if (v > 100) { rawSum += v; good++; } delay(2); }
+  if (good == 0) return lastGoodBatteryPct;
+  float analogVolts = ((float)rawSum / good) * (3.3 / 4095.0);
   float calculatedBatteryVolts = analogVolts * 2.0; 
   int pct = (int)((calculatedBatteryVolts - 3.4) / (4.2 - 3.4) * 100.0);
-  return max(0, min(pct, 100));
+  lastGoodBatteryPct = max(0, min(pct, 100));
+  batteryKnown = true;
+  return lastGoodBatteryPct;
 }
 
 // Defaults match the colors the panel used before they were configurable; saved colors replace them.
@@ -406,177 +421,403 @@ class ScoreboardServerCallbacks: public BLEServerCallbacks {
     }
 };
 
+// ---------------------------------------------------------------------------------------------
+// Second board. The first board (source) relays everything it gets from the phone to the second one
+// (follower) over ESP-NOW, so the phone keeps a single Bluetooth link: phone -> board 1 -> board 2.
+// Both boards sit on a fixed Wi-Fi channel while linked, so a linked board no longer joins the home Wi-Fi.
+// Linking: the app tells board 1 to look for a partner (60 s); holding BOOT for 2 s on board 2 makes it listen.
+// The boards swap addresses and remember each other in flash.
+// ---------------------------------------------------------------------------------------------
+#define MIRROR_CHANNEL        1
+#define MIRROR_PAIR_MS        60000
+#define MIRROR_BEAT_MS        2000     // follower -> source heartbeat, source -> follower full state refresh
+#define MIRROR_ONLINE_MS      7000
+#define MIRROR_BOOT_PIN       0
+#define MIRROR_PKT_STATE      1        // [1] + the phone's state packet
+#define MIRROR_PKT_CONFIG     2        // [2] + a config command
+#define MIRROR_PKT_BEAT       3        // [3, battery%] follower -> source
+#define MIRROR_PKT_BEACON     4        // source looking for a partner (broadcast)
+#define MIRROR_PKT_ACCEPT     5        // follower -> source: linked
+#define MIRROR_PKT_UNLINK     6
+
+enum MirrorRole { MIRROR_NONE, MIRROR_SOURCE, MIRROR_FOLLOWER };
+static MirrorRole mirrorRole = MIRROR_NONE;
+static uint8_t mirrorPeer[6] = {0};
+static bool mirrorReady = false;                 // ESP-NOW is running
+static bool mirrorPairing = false;               // source: sending beacons
+static bool mirrorListening = false;             // follower: waiting for a beacon
+static unsigned long mirrorWindowEnd = 0;
+static unsigned long mirrorLastHeard = 0;
+static uint8_t mirrorPeerBattery = 255;
+static volatile bool mirrorPersistPending = false, mirrorAcceptPending = false, mirrorNoticePending = false, mirrorClearPending = false;
+static const uint8_t mirrorBroadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+static void handleState(const uint8_t* rawData, size_t dataLength);
+static void handleConfig(const uint8_t* data, size_t len, bool viaMirror);
+
+static void mirrorAddPeer(const uint8_t *mac) {
+  if (esp_now_is_peer_exist(mac)) return;
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = 0;                       // the current channel
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+}
+
+static void mirrorSend(const uint8_t *mac, uint8_t type, const uint8_t *data, size_t len) {
+  if (!mirrorReady || len > 249) return;
+  uint8_t buf[250];
+  buf[0] = type;
+  if (len) memcpy(buf + 1, data, len);
+  for (int attempt = 0; attempt < 8; attempt++) {
+    if (esp_now_send(mac, buf, len + 1) == ESP_OK) return;
+    delay(3);                             // the send queue was full
+  }
+}
+
+// Phone -> board 1 -> board 2.
+static void mirrorForward(uint8_t type, const uint8_t *data, size_t len) {
+  if (mirrorRole == MIRROR_SOURCE) mirrorSend(mirrorPeer, type, data, len);
+}
+
+static void mirrorOnReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len < 1) return;
+  const uint8_t *src = info->src_addr;
+  uint8_t type = data[0];
+  if ((type == MIRROR_PKT_BEACON && mirrorListening) || (type == MIRROR_PKT_ACCEPT && mirrorPairing)) {
+    memcpy(mirrorPeer, src, 6);
+    mirrorAddPeer(src);
+    mirrorRole = (type == MIRROR_PKT_BEACON) ? MIRROR_FOLLOWER : MIRROR_SOURCE;
+    mirrorListening = false; mirrorPairing = false;
+    mirrorLastHeard = millis();
+    mirrorPersistPending = true; mirrorNoticePending = true;
+    if (type == MIRROR_PKT_BEACON) mirrorAcceptPending = true;
+    return;
+  }
+  if (mirrorRole == MIRROR_NONE || memcmp(src, mirrorPeer, 6) != 0) return;     // only the linked partner is heard
+  switch (type) {
+    case MIRROR_PKT_STATE:  if (mirrorRole == MIRROR_FOLLOWER) { handleState(data + 1, len - 1); mirrorLastHeard = millis(); } break;
+    case MIRROR_PKT_CONFIG: if (mirrorRole == MIRROR_FOLLOWER) { handleConfig(data + 1, len - 1, true); mirrorLastHeard = millis(); } break;
+    case MIRROR_PKT_BEAT:   if (mirrorRole == MIRROR_SOURCE && len >= 2) { mirrorLastHeard = millis(); mirrorPeerBattery = data[1]; } break;
+    case MIRROR_PKT_UNLINK: mirrorClearPending = true; break;
+  }
+}
+
+static void mirrorStartRadio() {
+  if (mirrorReady) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false, false);
+  WiFi.setSleep(false);                   // a sleeping radio would miss packets from the other board
+  esp_wifi_set_channel(MIRROR_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() != ESP_OK) { Serial.println("[mirror] ESP-NOW failed to start"); return; }
+  esp_now_register_recv_cb(mirrorOnReceive);
+  mirrorAddPeer(mirrorBroadcast);
+  if (mirrorRole != MIRROR_NONE) mirrorAddPeer(mirrorPeer);
+  mirrorReady = true;
+  Serial.println("[mirror] radio ready");
+}
+
+static void mirrorStopRadio() {
+  if (!mirrorReady) return;
+  esp_now_deinit();
+  mirrorReady = false;
+}
+
+static void mirrorSave() {
+  prefs.begin("scoreboard", false);
+  prefs.putUChar("mirrorRole", (uint8_t)mirrorRole);
+  prefs.putBytes("mirrorPeer", mirrorPeer, 6);
+  prefs.end();
+}
+
+static void mirrorLoad() {
+  prefs.begin("scoreboard", true);
+  uint8_t role = prefs.getUChar("mirrorRole", MIRROR_NONE);
+  if (role <= MIRROR_FOLLOWER && prefs.getBytesLength("mirrorPeer") == 6) {
+    mirrorRole = (MirrorRole)role;
+    prefs.getBytes("mirrorPeer", mirrorPeer, 6);
+  }
+  prefs.end();
+}
+
+static void mirrorUnlink(bool tellPartner) {
+  if (tellPartner && mirrorReady && mirrorRole != MIRROR_NONE) for (int i = 0; i < 3; i++) { mirrorSend(mirrorPeer, MIRROR_PKT_UNLINK, nullptr, 0); delay(20); }
+  if (mirrorReady && mirrorRole != MIRROR_NONE) esp_now_del_peer(mirrorPeer);
+  mirrorRole = MIRROR_NONE;
+  mirrorPairing = false; mirrorListening = false;
+  mirrorPeerBattery = 255;
+  mirrorSave();
+  Serial.println("[mirror] unlinked");
+}
+
+// [CMD_MIRROR, 1 = look for a partner | 2 = stop looking | 3 = unlink]
+static void mirrorCommand(const uint8_t *data, size_t len) {
+  uint8_t status = CFG_OK;
+  if (len != 2) status = CFG_BAD_ARG;
+  else if (data[1] == 1) {
+    if (mirrorRole != MIRROR_NONE) status = CFG_BAD_ARG;      // unlink first
+    else {
+      if (!mirrorReady) mirrorStartRadio();
+      mirrorListening = false; mirrorPairing = mirrorReady;
+      mirrorWindowEnd = millis() + MIRROR_PAIR_MS;
+      if (!mirrorReady) status = CFG_BAD_ARG;
+    }
+  }
+  else if (data[1] == 2) mirrorPairing = false;
+  else if (data[1] == 3) mirrorUnlink(true);
+  else status = CFG_BAD_ARG;
+  uint8_t resp[2] = { CMD_MIRROR, status };
+  pConfigChar->setValue(resp, 2);
+  pConfigChar->notify();
+}
+
+static bool mirrorOnline() { return mirrorRole == MIRROR_SOURCE && mirrorLastHeard != 0 && millis() - mirrorLastHeard < MIRROR_ONLINE_MS; }
+
+// Called from loop().
+static void mirrorService() {
+  unsigned long now = millis();
+  static unsigned long lastBeacon = 0, lastBeat = 0, bootDownAt = 0;
+  static bool bootWasDown = false;
+
+  if (mirrorClearPending) { mirrorClearPending = false; mirrorUnlink(false); }
+  if (mirrorPersistPending) { mirrorPersistPending = false; mirrorSave(); Serial.println("[mirror] linked"); }
+  if (mirrorAcceptPending) { mirrorAcceptPending = false; mirrorSend(mirrorPeer, MIRROR_PKT_ACCEPT, nullptr, 0); }
+  if (mirrorNoticePending) {                    // both boards say so on the panel
+    mirrorNoticePending = false;
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    alertText = "LINKED"; alertColor = panelColors[COLOR_ALERT_GAME]; alertUsesIcon = false;
+    alertStartMillis = now; alertActive = true;
+    xSemaphoreGive(stateMutex);
+  }
+
+  // BOOT button: 2-5 s listens for a partner, 6 s or more unlinks.
+  bool down = (digitalRead(MIRROR_BOOT_PIN) == LOW);
+  if (down && !bootWasDown) bootDownAt = now;
+  if (!down && bootWasDown) {
+    unsigned long held = now - bootDownAt;
+    if (held >= 6000 && mirrorRole != MIRROR_NONE) mirrorUnlink(true);
+    else if (held >= 2000 && held < 6000 && mirrorRole != MIRROR_SOURCE) {
+      if (mirrorRole == MIRROR_FOLLOWER) mirrorUnlink(true);
+      mirrorStartRadio();
+      mirrorListening = mirrorReady; mirrorPairing = false;
+      mirrorWindowEnd = now + MIRROR_PAIR_MS;
+    }
+  }
+  bootWasDown = down;
+
+  if ((mirrorPairing || mirrorListening) && (long)(now - mirrorWindowEnd) >= 0) {
+    mirrorPairing = false; mirrorListening = false;
+    if (mirrorRole == MIRROR_NONE) mirrorStopRadio();       // nobody answered: radio off again
+  }
+  if (mirrorPairing && now - lastBeacon >= 400) { lastBeacon = now; mirrorSend(mirrorBroadcast, MIRROR_PKT_BEACON, nullptr, 0); }
+
+  if (mirrorRole != MIRROR_NONE && mirrorReady && now - lastBeat >= MIRROR_BEAT_MS) {
+    lastBeat = now;
+    if (mirrorRole == MIRROR_FOLLOWER) {
+      uint8_t battery = (uint8_t)readBatteryPercentage();
+      if (!batteryKnown) battery = 255;          // no battery wired, or the reading keeps failing
+      mirrorSend(mirrorPeer, MIRROR_PKT_BEAT, &battery, 1);
+    } else if (hasReceivedState) {            // full refresh: the partner catches up after a lost packet or a late power-on
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      String names = homeName + "|" + awayName;
+      uint8_t packet[8 + 2 * NAME_MAX + 4];
+      size_t n = 0;
+      packet[n++] = homeScore; packet[n++] = awayScore; packet[n++] = period; packet[n++] = brightness;
+      packet[n++] = timerMin; packet[n++] = timerSec; packet[n++] = isTimerRunning ? 1 : 0; packet[n++] = totalPeriods;
+      for (size_t i = 0; i < names.length() && n < sizeof(packet); i++) packet[n++] = (uint8_t)names[i];
+      xSemaphoreGive(stateMutex);
+      mirrorSend(mirrorPeer, MIRROR_PKT_STATE, packet, n);
+    }
+  }
+}
+
+// The state packet from the phone, or relayed by the first board when this one mirrors it.
+static void handleState(const uint8_t* rawData, size_t dataLength) {
+    if (dataLength >= 8) {
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        hasReceivedState = true;
+        homeScore      = rawData[0];
+        awayScore      = rawData[1];
+        period         = rawData[2];
+        brightness     = constrain(rawData[3], 10, 120); // same range as the app's stepper
+        timerMin       = rawData[4];
+        timerSec       = rawData[5];
+        isTimerRunning = (rawData[6] == 1);
+        totalPeriods   = rawData[7];
+        lastTickMillis = millis();   // line the board's own seconds up with the phone's
+
+        dma_display->setBrightness8(brightness);
+
+        // Optional text: "home|away|ratio|label". Only the names are used; the period box and the
+        // clock are drawn from the header bytes above, which fit in any BLE packet size.
+        if (dataLength > 8) {
+            String payload = "";
+            for (size_t i = 8; i < dataLength; i++) { payload += (char)rawData[i]; }
+            int pipe1 = payload.indexOf('|');
+            if (pipe1 != -1) {
+                int pipe2 = payload.indexOf('|', pipe1 + 1);
+                homeName = payload.substring(0, pipe1).substring(0, NAME_MAX);
+                awayName = (pipe2 != -1 ? payload.substring(pipe1 + 1, pipe2) : payload.substring(pipe1 + 1)).substring(0, NAME_MAX);
+                homeName.toUpperCase(); awayName.toUpperCase();
+            }
+        }
+        marqueeSet(homeMarquee, homeName);
+        marqueeSet(awayMarquee, awayName);
+        sceneDirty = true;
+        xSemaphoreGive(stateMutex);
+    }
+}
+
 class FullControlCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
-        uint8_t* rawData = pCharacteristic->getData();
-        size_t dataLength = pCharacteristic->getLength();
-        
-        if (dataLength >= 8) {
-            xSemaphoreTake(stateMutex, portMAX_DELAY);
-            hasReceivedState = true;
-            homeScore      = rawData[0];
-            awayScore      = rawData[1];
-            period         = rawData[2];
-            brightness     = constrain(rawData[3], 10, 120); // same range as the app's stepper
-            timerMin       = rawData[4];
-            timerSec       = rawData[5];
-            isTimerRunning = (rawData[6] == 1);
-            totalPeriods   = rawData[7];
-            lastTickMillis = millis();   // line the board's own seconds up with the phone's
-
-            dma_display->setBrightness8(brightness);
-
-            // Optional text: "home|away|ratio|label". Only the names are used; the period box and the
-            // clock are drawn from the header bytes above, which fit in any BLE packet size.
-            if (dataLength > 8) {
-                String payload = "";
-                for (size_t i = 8; i < dataLength; i++) { payload += (char)rawData[i]; }
-                int pipe1 = payload.indexOf('|');
-                if (pipe1 != -1) {
-                    int pipe2 = payload.indexOf('|', pipe1 + 1);
-                    homeName = payload.substring(0, pipe1).substring(0, NAME_MAX);
-                    awayName = (pipe2 != -1 ? payload.substring(pipe1 + 1, pipe2) : payload.substring(pipe1 + 1)).substring(0, NAME_MAX);
-                    homeName.toUpperCase(); awayName.toUpperCase();
-                }
-            }
-            marqueeSet(homeMarquee, homeName);
-            marqueeSet(awayMarquee, awayName);
-            sceneDirty = true;
-            xSemaphoreGive(stateMutex);
-        }
+        handleState(pCharacteristic->getData(), pCharacteristic->getLength());
+        mirrorForward(MIRROR_PKT_STATE, pCharacteristic->getData(), pCharacteristic->getLength());
     }
 };
 
-class ConfigCallbacks: public BLECharacteristicCallbacks {
-    void reply(uint8_t cmd, uint8_t status) {
+// A config command from the phone, or relayed by the first board (viaMirror: no reply to send).
+static void handleConfig(const uint8_t* data, size_t len, bool viaMirror) {
+    if (len < 1) return;
+    auto reply = [&](uint8_t cmd, uint8_t status) {
+        if (viaMirror) return;
         uint8_t resp[2] = { cmd, status };
         pConfigChar->setValue(resp, 2);
         pConfigChar->notify();
-    }
+    };
 
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        uint8_t* data = pCharacteristic->getData();
-        size_t len = pCharacteristic->getLength();
-        if (len < 1) return;
-
-        switch (data[0]) {
-            case CMD_SET_NAME: {
-                size_t nameLen = len - 1;
-                bool valid = nameLen >= 1 && nameLen <= DEVICE_NAME_MAX;
-                for (size_t i = 1; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E); }
-                if (!valid) { reply(CMD_SET_NAME, CFG_BAD_ARG); return; }
-                pendingDeviceName = "";
-                for (size_t i = 1; i < len; i++) { pendingDeviceName += (char)data[i]; }
-                reply(CMD_SET_NAME, CFG_OK);
-                break;
-            }
-            case CMD_SET_COLORS: {
-                if (len != 1 + COLOR_COUNT * 2) { reply(CMD_SET_COLORS, CFG_BAD_ARG); return; }
+    switch (data[0]) {
+        case CMD_SET_NAME: {
+            size_t nameLen = len - 1;
+            bool valid = nameLen >= 1 && nameLen <= DEVICE_NAME_MAX;
+            for (size_t i = 1; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E); }
+            if (!valid) { reply(CMD_SET_NAME, CFG_BAD_ARG); return; }
+            pendingDeviceName = "";
+            for (size_t i = 1; i < len; i++) { pendingDeviceName += (char)data[i]; }
+            reply(CMD_SET_NAME, CFG_OK);
+            break;
+        }
+        case CMD_SET_COLORS: {
+            if (len != 1 + COLOR_COUNT * 2) { reply(CMD_SET_COLORS, CFG_BAD_ARG); return; }
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            for (int i = 0; i < COLOR_COUNT; i++) panelColors[i] = ((uint16_t)data[1 + i * 2] << 8) | data[2 + i * 2];
+            sceneDirty = true;
+            xSemaphoreGive(stateMutex);
+            prefs.begin("scoreboard", false); prefs.putBytes("colors", panelColors, sizeof(panelColors)); prefs.end();
+            reply(CMD_SET_COLORS, CFG_OK);
+            break;
+        }
+        case CMD_SET_VISIBILITY: {
+            if (len != 3) { reply(CMD_SET_VISIBILITY, CFG_BAD_ARG); return; }
+            uint16_t mask = ((uint16_t)data[1] | ((uint16_t)data[2] << 8)) & 0x01FF;
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            panelVisible = mask;
+            sceneDirty = true;
+            xSemaphoreGive(stateMutex);
+            prefs.begin("scoreboard", false); prefs.putUShort("visible", mask); prefs.end();
+            reply(CMD_SET_VISIBILITY, CFG_OK);
+            break;
+        }
+        case CMD_END_TEXT: {
+            size_t textLen = len - 1;
+            bool valid = textLen >= 1 && textLen <= ALERT_TEXT_MAX;
+            for (size_t i = 1; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E); }
+            if (!valid) { reply(CMD_END_TEXT, CFG_BAD_ARG); return; }
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            matchEndText = "";
+            for (size_t i = 1; i < len; i++) { matchEndText += (char)data[i]; }
+            xSemaphoreGive(stateMutex);
+            reply(CMD_END_TEXT, CFG_OK);
+            break;
+        }
+        case CMD_NAME_ICON: {
+            if (len == 2 && data[1] < 4) {                       // clear the slot
                 xSemaphoreTake(stateMutex, portMAX_DELAY);
-                for (int i = 0; i < COLOR_COUNT; i++) panelColors[i] = ((uint16_t)data[1 + i * 2] << 8) | data[2 + i * 2];
-                sceneDirty = true;
+                memset(nameIcons[data[1]], 0, sizeof(nameIcons[0])); sceneDirty = true;
                 xSemaphoreGive(stateMutex);
-                prefs.begin("scoreboard", false); prefs.putBytes("colors", panelColors, sizeof(panelColors)); prefs.end();
-                reply(CMD_SET_COLORS, CFG_OK);
-                break;
+                reply(CMD_NAME_ICON, CFG_OK); break;
             }
-            case CMD_SET_VISIBILITY: {
-                if (len != 3) { reply(CMD_SET_VISIBILITY, CFG_BAD_ARG); return; }
-                uint16_t mask = ((uint16_t)data[1] | ((uint16_t)data[2] << 8)) & 0x01FF;
-                xSemaphoreTake(stateMutex, portMAX_DELAY);
-                panelVisible = mask;
-                sceneDirty = true;
-                xSemaphoreGive(stateMutex);
-                prefs.begin("scoreboard", false); prefs.putUShort("visible", mask); prefs.end();
-                reply(CMD_SET_VISIBILITY, CFG_OK);
-                break;
+            size_t rows = (len >= 3) ? (len - 3) / (NAME_ICON_PX * 2) : 0;
+            if (len < 3 + NAME_ICON_PX * 2 || (len - 3) % (NAME_ICON_PX * 2) != 0 || data[1] > 3 || data[2] > NAME_ICON_PX - 1 || data[2] + rows > NAME_ICON_PX) {
+                reply(CMD_NAME_ICON, CFG_BAD_ARG); return;
             }
-            case CMD_END_TEXT: {
-                size_t textLen = len - 1;
-                bool valid = textLen >= 1 && textLen <= ALERT_TEXT_MAX;
-                for (size_t i = 1; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E); }
-                if (!valid) { reply(CMD_END_TEXT, CFG_BAD_ARG); return; }
-                xSemaphoreTake(stateMutex, portMAX_DELAY);
-                matchEndText = "";
-                for (size_t i = 1; i < len; i++) { matchEndText += (char)data[i]; }
-                xSemaphoreGive(stateMutex);
-                reply(CMD_END_TEXT, CFG_OK);
-                break;
-            }
-            case CMD_NAME_ICON: {
-                if (len == 2 && data[1] < 4) {                       // clear the slot
-                    xSemaphoreTake(stateMutex, portMAX_DELAY);
-                    memset(nameIcons[data[1]], 0, sizeof(nameIcons[0])); sceneDirty = true;
-                    xSemaphoreGive(stateMutex);
-                    reply(CMD_NAME_ICON, CFG_OK); break;
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            for (size_t r = 0; r < rows; r++)
+                for (int c = 0; c < NAME_ICON_PX; c++) {
+                    const uint8_t *px = &data[3 + (r * NAME_ICON_PX + c) * 2];
+                    nameIcons[data[1]][(data[2] + r) * NAME_ICON_PX + c] = ((uint16_t)px[0] << 8) | px[1];
                 }
-                size_t rows = (len >= 3) ? (len - 3) / (NAME_ICON_PX * 2) : 0;
-                if (len < 3 + NAME_ICON_PX * 2 || (len - 3) % (NAME_ICON_PX * 2) != 0 || data[1] > 3 || data[2] > NAME_ICON_PX - 1 || data[2] + rows > NAME_ICON_PX) {
-                    reply(CMD_NAME_ICON, CFG_BAD_ARG); return;
+            sceneDirty = true;
+            xSemaphoreGive(stateMutex);
+            reply(CMD_NAME_ICON, CFG_OK);
+            break;
+        }
+        case CMD_ALERT_ICON: {
+            if (len == 1) { alertIconRows = 0; reply(CMD_ALERT_ICON, CFG_OK); break; }          // remove the icon
+            size_t rows = (len >= 2) ? (len - 2) / 32 : 0;
+            if (len < 34 || (len - 2) % 32 != 0 || data[1] > 15 || data[1] + rows > 16) { reply(CMD_ALERT_ICON, CFG_BAD_ARG); return; }
+            for (size_t r = 0; r < rows; r++) {
+                for (int c = 0; c < 16; c++) {
+                    const uint8_t *px = &data[2 + r * 32 + c * 2];
+                    alertIcon[(data[1] + r) * 16 + c] = ((uint16_t)px[0] << 8) | px[1];
                 }
-                xSemaphoreTake(stateMutex, portMAX_DELAY);
-                for (size_t r = 0; r < rows; r++)
-                    for (int c = 0; c < NAME_ICON_PX; c++) {
-                        const uint8_t *px = &data[3 + (r * NAME_ICON_PX + c) * 2];
-                        nameIcons[data[1]][(data[2] + r) * NAME_ICON_PX + c] = ((uint16_t)px[0] << 8) | px[1];
-                    }
-                sceneDirty = true;
-                xSemaphoreGive(stateMutex);
-                reply(CMD_NAME_ICON, CFG_OK);
-                break;
+                alertIconRows |= (uint16_t)(1u << (data[1] + r));
             }
-            case CMD_ALERT_ICON: {
-                if (len == 1) { alertIconRows = 0; reply(CMD_ALERT_ICON, CFG_OK); break; }          // remove the icon
-                size_t rows = (len >= 2) ? (len - 2) / 32 : 0;
-                if (len < 34 || (len - 2) % 32 != 0 || data[1] > 15 || data[1] + rows > 16) { reply(CMD_ALERT_ICON, CFG_BAD_ARG); return; }
-                for (size_t r = 0; r < rows; r++) {
-                    for (int c = 0; c < 16; c++) {
-                        const uint8_t *px = &data[2 + r * 32 + c * 2];
-                        alertIcon[(data[1] + r) * 16 + c] = ((uint16_t)px[0] << 8) | px[1];
-                    }
-                    alertIconRows |= (uint16_t)(1u << (data[1] + r));
-                }
-                reply(CMD_ALERT_ICON, CFG_OK);
-                break;
-            }
-            case CMD_ALERT: {
-                size_t textLen = len - 2;
-                bool valid = len >= 3 && textLen <= ALERT_TEXT_MAX && (data[1] == 1 || data[1] == 2 || data[1] == 3);
-                for (size_t i = 2; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E) || (data[1] == 3 && isIconChar((char)data[i])); }   // goal alerts may carry the team's emoji (bytes 1-4)
-                if (!valid) { reply(CMD_ALERT, CFG_BAD_ARG); return; }
-                bool isPeriod = (data[1] == 2);                       // goal alerts share the game start alert's color and switch
-                if (!shown(isPeriod ? COLOR_ALERT_PERIOD : COLOR_ALERT_GAME)) { reply(CMD_ALERT, CFG_OK); return; }   // this alert is switched off
-                xSemaphoreTake(stateMutex, portMAX_DELAY);
-                String incoming = "";
-                for (size_t i = 2; i < len; i++) { incoming += (char)data[i]; }
-                incoming.toUpperCase();
-                if (alertActive && incoming == alertText && millis() - alertStartMillis < 3000) {   // same alert already playing (the board announced the end itself): do not restart it
-                    xSemaphoreGive(stateMutex);
-                    reply(CMD_ALERT, CFG_OK);
-                    break;
-                }
-                alertText = "";
-                for (size_t i = 2; i < len; i++) { alertText += (char)data[i]; }
-                alertText.toUpperCase();
-                alertColor = panelColors[isPeriod ? COLOR_ALERT_PERIOD : COLOR_ALERT_GAME];
-                alertUsesIcon = (data[1] == 3 && alertIconRows == 0xFFFF);
-                alertStartMillis = millis();
-                alertActive = true;
+            reply(CMD_ALERT_ICON, CFG_OK);
+            break;
+        }
+        case CMD_ALERT: {
+            size_t textLen = len - 2;
+            bool valid = len >= 3 && textLen <= ALERT_TEXT_MAX && (data[1] == 1 || data[1] == 2 || data[1] == 3);
+            for (size_t i = 2; valid && i < len; i++) { valid = (data[i] >= 0x20 && data[i] <= 0x7E) || (data[1] == 3 && isIconChar((char)data[i])); }   // goal alerts may carry the team's emoji (bytes 1-4)
+            if (!valid) { reply(CMD_ALERT, CFG_BAD_ARG); return; }
+            bool isPeriod = (data[1] == 2);                       // goal alerts share the game start alert's color and switch
+            if (!shown(isPeriod ? COLOR_ALERT_PERIOD : COLOR_ALERT_GAME)) { reply(CMD_ALERT, CFG_OK); return; }   // this alert is switched off
+            xSemaphoreTake(stateMutex, portMAX_DELAY);
+            String incoming = "";
+            for (size_t i = 2; i < len; i++) { incoming += (char)data[i]; }
+            incoming.toUpperCase();
+            if (alertActive && incoming == alertText && millis() - alertStartMillis < 3000) {   // same alert already playing (the board announced the end itself): do not restart it
                 xSemaphoreGive(stateMutex);
                 reply(CMD_ALERT, CFG_OK);
                 break;
             }
-            case CMD_APPLY: {
-                if (pendingDeviceName.length() == 0) { reply(CMD_APPLY, CFG_NOTHING_STAGED); return; }
-                deviceBroadcastName = pendingDeviceName;
-                pendingDeviceName = "";
-                prefs.begin("scoreboard", false); prefs.putString("devName", deviceBroadcastName); prefs.end();
-                reply(CMD_APPLY, CFG_OK);
-                delay(500); esp_restart();
-                break;
-            }
-            default:
-                reply(data[0], CFG_BAD_ARG);
+            alertText = "";
+            for (size_t i = 2; i < len; i++) { alertText += (char)data[i]; }
+            alertText.toUpperCase();
+            alertColor = panelColors[isPeriod ? COLOR_ALERT_PERIOD : COLOR_ALERT_GAME];
+            alertUsesIcon = (data[1] == 3 && alertIconRows == 0xFFFF);
+            alertStartMillis = millis();
+            alertActive = true;
+            xSemaphoreGive(stateMutex);
+            reply(CMD_ALERT, CFG_OK);
+            break;
+        }
+        case CMD_APPLY: {
+            if (pendingDeviceName.length() == 0) { reply(CMD_APPLY, CFG_NOTHING_STAGED); return; }
+            deviceBroadcastName = pendingDeviceName;
+            pendingDeviceName = "";
+            prefs.begin("scoreboard", false); prefs.putString("devName", deviceBroadcastName); prefs.end();
+            reply(CMD_APPLY, CFG_OK);
+            delay(500); esp_restart();
+            break;
+        }
+        default:
+            reply(data[0], CFG_BAD_ARG);
+    }
+}
+
+class ConfigCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        const uint8_t* data = pCharacteristic->getData();
+        size_t len = pCharacteristic->getLength();
+        if (len < 1) return;
+        if (data[0] == CMD_MIRROR) { mirrorCommand(data, len); return; }
+        handleConfig(data, len, false);
+        switch (data[0]) {      // everything that changes what the panel shows goes to the second board too
+            case CMD_SET_COLORS: case CMD_SET_VISIBILITY: case CMD_END_TEXT: case CMD_NAME_ICON: case CMD_ALERT_ICON: case CMD_ALERT:
+                mirrorForward(MIRROR_PKT_CONFIG, data, len);
         }
     }
 };
@@ -596,27 +837,22 @@ static uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t len) {
   return crc;
 }
 
-// Wi-Fi and Bluetooth share one radio: an idle-looking Wi-Fi connection still costs Bluetooth packets, which stalls a long transfer.
-// So Wi-Fi is switched off while a Bluetooth update runs and comes back when it ends or fails.
+// The mirror radio (ESP-NOW) and Bluetooth share one radio: an idle-looking link still costs Bluetooth packets, which stalls a long transfer.
+// So the mirror radio is switched off while a Bluetooth update runs and comes back when it ends or fails.
 static bool wifiPausedForOta = false;
-static bool otaWifiRestartPending = false;
 
 static void otaWifiPause() {
   if (wifiPausedForOta) return;
   wifiPausedForOta = true;
-  ArduinoOTA.end();
-  otaWifiRestartPending = true;                   // loop() starts ArduinoOTA again once Wi-Fi is back
-  WiFi.disconnect(true, false);
-  WiFi.mode(WIFI_OFF);
-  Serial.println("[ble-ota] Wi-Fi off for the update");
+  mirrorStopRadio();
+  Serial.println("[ble-ota] radio off for the update");
 }
 
 static void otaWifiResume() {
   if (!wifiPausedForOta) return;
   wifiPausedForOta = false;
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.println("[ble-ota] Wi-Fi back on");
+  if (mirrorRole != MIRROR_NONE) mirrorStartRadio();
+  Serial.println("[ble-ota] radio back on");
 }
 
 static void otaNotifyData(uint8_t op, uint8_t status, const uint8_t *extra, size_t extraLen) {
@@ -799,34 +1035,9 @@ void setup() {
   marqueeSet(awayMarquee, awayName);
   drawScoreboard();
 
-  // 📡 SILENT BACKGROUND WI-FI OTA INITIALIZATION
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
-    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
-      Serial.printf("[wifi] connected, IP %s, RSSI %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
-      Serial.printf("[wifi] disconnected, reason %d\n", info.wifi_sta_disconnected.reason);
-    }
-  });
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.println("[wifi] connecting...");
-  
-  // Set up local Arduino OTA network port name
-  // Hostnames may only contain letters, digits and "-": "Scoreboard_Beta" becomes "Scoreboard-Beta".
-  String otaHost = deviceBroadcastName;
-  for (size_t i = 0; i < otaHost.length(); i++) {
-    char c = otaHost[i];
-    if (!isalnum((unsigned char)c) && c != '-') otaHost.setCharAt(i, '-');
-  }
-  char otaNameBuffer[32];
-  otaHost.toCharArray(otaNameBuffer, 32);
-  ArduinoOTA.setHostname(otaNameBuffer);
-  ArduinoOTA.setPassword(OTA_PASSWORD);
-
-  ArduinoOTA.onStart([]() { Serial.println("Wireless flashing started..."); });
-  ArduinoOTA.onEnd([]() { Serial.println("\nWireless flash complete! Rebooting..."); });
-  // ArduinoOTA.begin() (and its mDNS announcement) is called from loop() once Wi-Fi has an IP.
+  pinMode(MIRROR_BOOT_PIN, INPUT_PULLUP);
+  mirrorLoad();
+  if (mirrorRole != MIRROR_NONE) mirrorStartRadio();      // linked boards talk to each other
 
   // Bluetooth configuration setup
   char nameBuffer[32];
@@ -870,6 +1081,7 @@ void loop() {
   unsigned long currentMillis = millis();
 
   otaService();   // firmware update over Bluetooth: flash writes happen here, outside the state mutex
+  mirrorService();
 
   // Clock, scrolling names and redraw. The clock keeps counting here even if the phone link drops.
   xSemaphoreTake(stateMutex, portMAX_DELAY);
@@ -905,31 +1117,16 @@ void loop() {
   } else if (sceneDirty) { sceneDirty = false; drawScoreboard(); }
   xSemaphoreGive(stateMutex);
 
-  // Handle background wireless Arduino IDE port listening check requests
-  static unsigned long lastWifiLogMillis = 0;
-  if (currentMillis - lastWifiLogMillis >= 10000) {
-    lastWifiLogMillis = currentMillis;
-    // status: 3 = connected, 1 = network not found (not visible on 2.4 GHz?), 4 = connect failed (wrong password?), 6 = disconnected
-    Serial.printf("[wifi] status %d, IP %s, ble %s\n", WiFi.status(), WiFi.localIP().toString().c_str(),
-                  currentBLEState == LINKED_CONNECTED ? "linked" : "waiting");
-  }
-  static bool otaStarted = false;
-  if (!otaStarted && !wifiPausedForOta && WiFi.status() == WL_CONNECTED) {
-    ArduinoOTA.begin();
-    otaStarted = true;
-    Serial.printf("[ota] ready as %s.local\n", ArduinoOTA.getHostname().c_str());
-  }
-  if (otaWifiRestartPending && !wifiPausedForOta) { otaStarted = false; otaWifiRestartPending = false; }   // Wi-Fi was cycled: start ArduinoOTA again once it reconnects
-  if (otaStarted && !wifiPausedForOta) ArduinoOTA.handle();
-
   static unsigned long lastNotifyMillis = 0;
   if (currentBLEState == LINKED_CONNECTED && currentMillis - lastNotifyMillis >= 2000) {
      lastNotifyMillis = currentMillis;
      batteryPct = readBatteryPercentage();
      
      // FIXED: Added array assignment tracking brackets to structure multi-byte list payloads
-     uint8_t flags = (batteryPct < 15 ? FLAG_LOW_BATTERY : 0) | (pendingDeviceName.length() > 0 ? FLAG_RENAME_STAGED : 0);
-     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct, flags, PROTOCOL_VERSION, FW_VERSION_MAJOR, FW_VERSION_MINOR, FW_VERSION_PATCH };
+     uint8_t flags = (batteryPct < 15 ? FLAG_LOW_BATTERY : 0) | (pendingDeviceName.length() > 0 ? FLAG_RENAME_STAGED : 0)
+                     | (mirrorRole == MIRROR_SOURCE ? FLAG_MIRROR_SOURCE : 0) | (mirrorOnline() ? FLAG_MIRROR_ONLINE : 0)
+                     | (mirrorRole == MIRROR_FOLLOWER ? FLAG_MIRROR_FOLLOWER : 0) | (mirrorPairing ? FLAG_MIRROR_PAIRING : 0);
+     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct, flags, PROTOCOL_VERSION, FW_VERSION_MAJOR, FW_VERSION_MINOR, FW_VERSION_PATCH, (uint8_t)(mirrorOnline() ? mirrorPeerBattery : 255) };
      pChar->setValue(telemetryPacket, sizeof(telemetryPacket)); pChar->notify();
   }
 
@@ -939,6 +1136,9 @@ void loop() {
 
     if (otaState != FWU_IDLE) {                      // firmware update running: blink red until it is done
       statusLED.setPixelColor(0, blinkToggleState ? statusLED.Color(200, 0, 0) : statusLED.Color(0, 0, 0)); statusLED.show();
+    }
+    else if (mirrorPairing || mirrorListening) {     // looking for the second board: purple
+      statusLED.setPixelColor(0, blinkToggleState ? statusLED.Color(150, 0, 200) : statusLED.Color(0, 0, 0)); statusLED.show();
     }
     else if (currentBLEState == LINKED_CONNECTED) {  // back to solid green (an update may have just ended or failed)
       statusLED.setPixelColor(0, statusLED.Color(0, 150, 0)); statusLED.show();
