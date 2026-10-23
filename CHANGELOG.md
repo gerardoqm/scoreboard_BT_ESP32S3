@@ -2,6 +2,9 @@
 
 Versions follow `major.minor.patch` (see the Versions section of the README).
 
+## 1.4.1
+- Wi-Fi networking removed: the board no longer joins a Wi-Fi network or runs `ArduinoOTA`, so `secrets.h` only needs `OTA_PASSWORD` (the Bluetooth update key) and no Wi-Fi password ends up in the firmware image. The board-to-board mirror (ESP-NOW) is unchanged. Update over Bluetooth or USB.
+
 ## Documentation fix
 - Power: the diagram and the text now show a 5 A fuse and a 10 A switch in the load path, the charge board off the load path, the XL6009 fed from the battery (it feeds both the panel and the ESP32), and the voltage divider after the switch. A power-bank style board in the load path overheated and made the 5 V sag, which killed the green and blue LEDs first.
 - Build setting: **PSRAM is now Disabled** in the documented compilation settings. The firmware never uses PSRAM, and with `OPI PSRAM` selected a board with a faulty PSRAM restarted in a loop at power-up (reset reason RTCWDT), whatever sketch it ran.
