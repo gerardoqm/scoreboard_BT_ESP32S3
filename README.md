@@ -65,6 +65,12 @@ To prevent flash memory restriction errors (`[Errno 32] Broken Pipe`), apply the
 
 `tools/panel-test/panel-test.ino` is a small sketch that shows four colour bands (red, green, blue, white) and repeats them for each driver chip type the display library supports, so you can see which one your panel needs. Its header explains how to read the result. If the board restarts in a loop and never starts, build with **PSRAM: Disabled**.
 
+**Choosing the panel's driver setting (firmware 1.5.0).** A panel cannot tell the board which driver chip it has, so you pick the setting by eye; the choice is saved on the board. Two ways:
+- In the app: **Panel type** lists the 12 settings. Pick one: the board saves it, restarts and the app reconnects. Preset 0 (`SHIFTREG`) is the default.
+- On the board: press BOOT within 2 seconds after turning it on (the LED blinks white). The panel shows the setting's name over colour bands, a border and a diagonal; a short BOOT press tries the next one, holding BOOT for 3 seconds leaves. Use it when the panel shows nothing, since the app cannot help you see what is wrong. (Do not hold BOOT while powering on: that starts the ROM loader.)
+
+A setting is right when the four colour bands are clean and steady, the border is complete on all four edges and the diagonal is straight. Dark means the wrong chip; wrong colours mean the right family but not the chip; a shifted or doubled picture or flicker means try the same chip with the "B" clock phase.
+
 ### Update key setup
 The Bluetooth update key is kept out of the sketch in a **gitignored** `secrets.h`:
 

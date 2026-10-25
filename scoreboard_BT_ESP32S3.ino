@@ -61,6 +61,7 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 #define CMD_END_TEXT   0x08 // args: 1-32 ASCII characters: what the board scrolls by itself when the last period runs out (the app sends it in its language)
 #define CMD_MIRROR     0x09 // args: 1 = look for a second board (60 s), 2 = stop looking, 3 = unlink the second board. The second board mirrors this one over ESP-NOW.
                             // Link the second board by holding its BOOT button for 2 s while the first one is looking. Hold BOOT for 6 s to unlink from the second board.
+#define CMD_PANEL      0x0A // args: preset 0-11 (see PANEL_PRESETS below): saves the panel driver preference and restarts the board
 // Firmware update over Bluetooth: own characteristic. Phone -> board writes start with an opcode; replies are
 // notifications [opcode, status, ...]. Data chunks are written without response and acknowledged every 4 KB.
 #define OTA_UUID           "87654321-4321-4321-4321-210987654323"
@@ -103,13 +104,14 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // v8 raises the alert text limit from 16 to 32 characters (long team names in goal alerts).
 // v9 adds CMD_END_TEXT and the board announces the end of the match by itself.
 // v10 adds CMD_MIRROR: a second board shows the same scoreboard, linked board to board with ESP-NOW. Telemetry gets a byte 10 (second board's battery).
+// v11 adds CMD_PANEL (choose the panel's driver chip setting) and telemetry byte 11 (the current preset).
 // v5 adds firmware updates over Bluetooth (OTA characteristic) and the firmware version as bytes 7-9 of the telemetry (10 bytes).
-#define PROTOCOL_VERSION 10
+#define PROTOCOL_VERSION 11
 // Firmware version, semantic: bump PATCH for fixes, MINOR for features that stay compatible, MAJOR for breaking changes.
 // Sent in the telemetry (bytes 7-9) so the app can show it and compare it with the image bundled in the app.
 // PROTOCOL_VERSION above is only for the app's feature checks; the version below is what people see.
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 4
+#define FW_VERSION_MINOR 5
 #define FW_VERSION_PATCH 1
 #define FLAG_LOW_BATTERY    0x01  // battery below 15%
 #define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
@@ -132,6 +134,14 @@ enum PanelColor { COLOR_TIMER_RUNNING, COLOR_TIMER_STOPPED, COLOR_PERIOD, COLOR_
                   COLOR_AWAY_NAME, COLOR_AWAY_SCORE, COLOR_ALERT_GAME, COLOR_ALERT_PERIOD, COLOR_COUNT };
 uint16_t panelColors[COLOR_COUNT];
 uint16_t panelVisible = 0x01FF;   // bit i set = element i is shown (all nine by default)
+
+// Panel driver presets. HUB75 is one-way (the panel cannot be asked what chip it has), so the right setting is found by eye:
+// the diagnose mode (BOOT within 2 s after power-up) and the app's Panel type page step through these and save the one that looks right.
+// Preset 0 is the default and what the firmware always used. Keep the names in sync with PanelType in the app.
+#define PANEL_PRESETS 12
+static const char *PANEL_PRESET_NAMES[PANEL_PRESETS] = { "SHIFTREG", "SHIFTREG B", "FM6124", "FM6124 B", "FM6126A", "FM6126A B",
+                                                         "ICN2038S", "ICN2038S B", "MBI5124", "MBI5124 B", "DP3246", "DP3246 B" };
+static uint8_t panelPreset = 0;    // driver = preset / 2, clock phase inverted for the "B" presets (odd numbers)
 
 
 // Core Board Counters
@@ -814,6 +824,12 @@ class ConfigCallbacks: public BLECharacteristicCallbacks {
         size_t len = pCharacteristic->getLength();
         if (len < 1) return;
         if (data[0] == CMD_MIRROR) { mirrorCommand(data, len); return; }
+        if (data[0] == CMD_PANEL) {         // [CMD_PANEL, preset]: this board only, not relayed to the second one
+            uint8_t resp[2] = { CMD_PANEL, (uint8_t)((len == 2 && data[1] < PANEL_PRESETS) ? CFG_OK : CFG_BAD_ARG) };
+            pConfigChar->setValue(resp, 2); pConfigChar->notify();
+            if (resp[1] == CFG_OK) { prefs.begin("scoreboard", false); prefs.putUChar("panelPreset", data[1]); prefs.end(); delay(400); ESP.restart(); }
+            return;
+        }
         handleConfig(data, len, false);
         switch (data[0]) {      // everything that changes what the panel shows goes to the second board too
             case CMD_SET_COLORS: case CMD_SET_VISIBILITY: case CMD_END_TEXT: case CMD_NAME_ICON: case CMD_ALERT_ICON: case CMD_ALERT:
@@ -1008,6 +1024,48 @@ static void otaService() {
   }
 }
 
+static HUB75_I2S_CFG::shift_driver panelDriverFor(uint8_t preset) {
+  static const HUB75_I2S_CFG::shift_driver drivers[6] = { HUB75_I2S_CFG::SHIFTREG, HUB75_I2S_CFG::FM6124, HUB75_I2S_CFG::FM6126A,
+                                                          HUB75_I2S_CFG::ICN2038S, HUB75_I2S_CFG::MBI5124, HUB75_I2S_CFG::DP3246 };
+  return drivers[(preset / 2) % 6];
+}
+
+// ---------------------------------------------------------------------------------------------
+// Panel diagnose mode. Shows the current preset's name over test patterns: colour bands, a border and a diagonal.
+// A short BOOT press saves the next preset and restarts; holding BOOT for 3 s leaves and restarts normally.
+// What counts as right: four clean bands, a complete border and a straight diagonal, no flicker.
+// ---------------------------------------------------------------------------------------------
+static void runPanelDiagnose() {
+  const uint16_t W = PANEL_RES_X, H = PANEL_RES_Y;
+  uint16_t colors[4] = { dma_display->color565(255, 0, 0), dma_display->color565(0, 255, 0), dma_display->color565(0, 0, 255), dma_display->color565(255, 255, 255) };
+  dma_display->clearScreen();
+  for (int i = 0; i < 4; i++) dma_display->fillRect(i * (W / 4), 10, W / 4, H - 20, colors[i]);
+  dma_display->drawRect(0, 0, W, H, dma_display->color565(255, 255, 0));
+  dma_display->drawLine(1, 1, W - 2, H - 2, dma_display->color565(255, 0, 255));
+  dma_display->setTextWrap(false);
+  dma_display->setTextSize(1);
+  dma_display->setTextColor(dma_display->color565(255, 255, 255));
+  dma_display->setCursor(3, 2);
+  dma_display->printf("%u/%u %s", panelPreset + 1, PANEL_PRESETS, PANEL_PRESET_NAMES[panelPreset]);
+  dma_display->setCursor(3, H - 8);
+  dma_display->print("BOOT next  HOLD exit");
+  Serial.printf("[panel] diagnose, preset %u: %s\n", panelPreset, PANEL_PRESET_NAMES[panelPreset]);
+  while (digitalRead(0) == LOW) delay(10);          // the press that opened diagnose mode
+  while (true) {
+    statusLED.setPixelColor(0, ((millis() / 400) % 2) ? statusLED.Color(0, 100, 200) : statusLED.Color(0, 0, 0)); statusLED.show();
+    if (digitalRead(0) == LOW) {
+      unsigned long down = millis();
+      while (digitalRead(0) == LOW && millis() - down < 3000) delay(10);
+      bool held = (millis() - down >= 3000);
+      if (!held) {
+        prefs.begin("scoreboard", false); prefs.putUChar("panelPreset", (panelPreset + 1) % PANEL_PRESETS); prefs.putBool("diagNext", true); prefs.end();
+      }
+      delay(100); ESP.restart();
+    }
+    delay(20);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   analogSetAttenuation(ADC_11db); 
@@ -1015,7 +1073,21 @@ void setup() {
 
   prefs.begin("scoreboard", false);
   deviceBroadcastName = prefs.getString("devName", "Scoreboard_Beta");
+  panelPreset = prefs.getUChar("panelPreset", 0);
+  if (panelPreset >= PANEL_PRESETS) panelPreset = 0;
+  bool diagnose = prefs.getBool("diagNext", false);      // set by a BOOT press in diagnose mode: show the next preset's pattern straight away
+  if (diagnose) prefs.putBool("diagNext", false);
   prefs.end();
+
+  // Diagnose window: a BOOT press in the first 2 s (white blink) opens the panel diagnose mode.
+  // (Holding BOOT while powering on would start the ROM loader instead.)
+  pinMode(0, INPUT_PULLUP);
+  for (unsigned long t0 = millis(); millis() - t0 < 2000 && !diagnose; ) {
+    statusLED.setPixelColor(0, ((millis() / 150) % 2) ? statusLED.Color(120, 120, 120) : statusLED.Color(0, 0, 0)); statusLED.show();
+    diagnose = (digitalRead(0) == LOW);
+    delay(10);
+  }
+  statusLED.setPixelColor(0, 0); statusLED.show();
 
   HUB75_I2S_CFG mxconfig(PANEL_RES_X, PANEL_RES_Y, PANEL_CHAIN_1);
   mxconfig.gpio.r1 = R1_PIN; mxconfig.gpio.g1 = G1_PIN; mxconfig.gpio.b1 = B1_PIN;
@@ -1023,10 +1095,11 @@ void setup() {
   mxconfig.gpio.a  = A_PIN;  mxconfig.gpio.b  = B_PIN;  mxconfig.gpio.c  = C_PIN; mxconfig.gpio.d = D_PIN; 
   mxconfig.gpio.e  = E_PIN;
   mxconfig.gpio.lat = LAT_PIN; mxconfig.gpio.oe = OE_PIN; mxconfig.gpio.clk = CLK_PIN;
-  mxconfig.clkphase = false; mxconfig.driver = HUB75_I2S_CFG::SHIFTREG;
+  mxconfig.clkphase = (panelPreset % 2 == 1); mxconfig.driver = panelDriverFor(panelPreset);
 
   dma_display = new MatrixPanel_I2S_DMA(mxconfig); dma_display->begin();
   dma_display->setBrightness8(brightness);
+  if (diagnose) runPanelDiagnose();     // never returns
   loadPanelColors();
   frame = new GFXcanvas16(PANEL_RES_X, PANEL_RES_Y);
   slotCanvas = new GFXcanvas16(NAME_SLOT_W, NAME_SLOT_H);
@@ -1126,7 +1199,7 @@ void loop() {
      uint8_t flags = (batteryPct < 15 ? FLAG_LOW_BATTERY : 0) | (pendingDeviceName.length() > 0 ? FLAG_RENAME_STAGED : 0)
                      | (mirrorRole == MIRROR_SOURCE ? FLAG_MIRROR_SOURCE : 0) | (mirrorOnline() ? FLAG_MIRROR_ONLINE : 0)
                      | (mirrorRole == MIRROR_FOLLOWER ? FLAG_MIRROR_FOLLOWER : 0) | (mirrorPairing ? FLAG_MIRROR_PAIRING : 0);
-     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct, flags, PROTOCOL_VERSION, FW_VERSION_MAJOR, FW_VERSION_MINOR, FW_VERSION_PATCH, (uint8_t)(mirrorOnline() ? mirrorPeerBattery : 255) };
+     uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct, flags, PROTOCOL_VERSION, FW_VERSION_MAJOR, FW_VERSION_MINOR, FW_VERSION_PATCH, (uint8_t)(mirrorOnline() ? mirrorPeerBattery : 255), panelPreset };
      pChar->setValue(telemetryPacket, sizeof(telemetryPacket)); pChar->notify();
   }
 
