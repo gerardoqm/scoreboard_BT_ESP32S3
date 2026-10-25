@@ -2,6 +2,14 @@
 
 Versions follow `major.minor.patch` (see the Versions section of the README).
 
+## 1.6.1
+- The hundredths of a second are as big as the clock's digits (`00:41.36`, dropping the leading zeros when the period text is wide: `0:41.36`, `41.36`) and have their own color: new command `CMD_TICKER_COLOR` (0x0D, RGB565, saved in flash, red by default). Protocol version 12 as in 1.6.0.
+
+## 1.6.0
+- Hundredths of a second in the last minute: while the clock runs with less than a minute left, the panel shows it as `00:41.36`, in a small font after the clock in this first version. New command `CMD_TICKER` (0x0B, 0 or 1), saved in flash, on by default.
+- A bigger goal icon: `CMD_ALERT_ICON_BIG` (0x0C) takes a 32 x 32 picture, drawn centered on the panel's height in front of the goal text (the 16 x 16 icon of `CMD_ALERT_ICON` remains as the fallback). Protocol version 12.
+- The second board keeps its own clock phase when the first board refreshes it, so its seconds and hundredths no longer jump every two seconds.
+
 ## 1.5.1
 - Diagnose mode: a short BOOT press now restarts straight into the next preset's test pattern (before, the board started normally and BOOT had to be pressed again within 2 seconds).
 
