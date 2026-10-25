@@ -61,6 +61,10 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 #define CMD_END_TEXT   0x08 // args: 1-32 ASCII characters: what the board scrolls by itself when the last period runs out (the app sends it in its language)
 #define CMD_MIRROR     0x09 // args: 1 = look for a second board (60 s), 2 = stop looking, 3 = unlink the second board. The second board mirrors this one over ESP-NOW.
                             // Link the second board by holding its BOOT button for 2 s while the first one is looking. Hold BOOT for 6 s to unlink from the second board.
+#define CMD_TICKER     0x0B // args: 0 or 1: hundredths of a second next to the clock while it runs in the last minute; saved to flash
+#define CMD_TICKER_COLOR 0x0D // args: RGB565 big-endian: the color of the hundredths of a second in the last minute; saved to flash
+#define CMD_ALERT_ICON_BIG 0x0C // args: first row (0-31) + 1-2 rows of 32 pixels, RGB565 big-endian (64 bytes per row); no args = remove the big icon
+                            // The goal alert (CMD_ALERT type 3) scrolls this 32x32 picture in front of its text; the 16x16 one (CMD_ALERT_ICON) is the fallback.
 #define CMD_PANEL      0x0A // args: preset 0-11 (see PANEL_PRESETS below): saves the panel driver preference and restarts the board
 // Firmware update over Bluetooth: own characteristic. Phone -> board writes start with an opcode; replies are
 // notifications [opcode, status, ...]. Data chunks are written without response and acknowledged every 4 KB.
@@ -105,13 +109,14 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // v9 adds CMD_END_TEXT and the board announces the end of the match by itself.
 // v10 adds CMD_MIRROR: a second board shows the same scoreboard, linked board to board with ESP-NOW. Telemetry gets a byte 10 (second board's battery).
 // v11 adds CMD_PANEL (choose the panel's driver chip setting) and telemetry byte 11 (the current preset).
+// v12 adds CMD_TICKER (hundredths of a second in the last minute) and CMD_ALERT_ICON_BIG (a 32x32 goal icon).
 // v5 adds firmware updates over Bluetooth (OTA characteristic) and the firmware version as bytes 7-9 of the telemetry (10 bytes).
-#define PROTOCOL_VERSION 11
+#define PROTOCOL_VERSION 12
 // Firmware version, semantic: bump PATCH for fixes, MINOR for features that stay compatible, MAJOR for breaking changes.
 // Sent in the telemetry (bytes 7-9) so the app can show it and compare it with the image bundled in the app.
 // PROTOCOL_VERSION above is only for the app's feature checks; the version below is what people see.
 #define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 5
+#define FW_VERSION_MINOR 6
 #define FW_VERSION_PATCH 1
 #define FLAG_LOW_BATTERY    0x01  // battery below 15%
 #define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
@@ -177,7 +182,13 @@ String matchEndText = "FULL TIME";     // set by the app (CMD_END_TEXT); the boa
 uint16_t nameIcons[4][NAME_ICON_PX * NAME_ICON_PX];   // RGB565, 0 = transparent
 uint16_t alertIcon[16 * 16];            // goal icon, RGB565; 0 = transparent
 uint16_t alertIconRows = 0;             // bit r set = row r has been received; all 16 = the icon is complete
+uint16_t alertIconBig[32 * 32];         // the 32 x 32 version of the goal icon
+uint32_t alertIconBigRows = 0;
 bool alertUsesIcon = false;
+bool alertIconIsBig = false;
+bool tickerOn = true;                   // hundredths of a second in the last minute (CMD_TICKER)
+uint16_t tickerColor = 0xF9A0;          // ... in this color (CMD_TICKER_COLOR); red until the app sends another
+unsigned long lastTickerDraw = 0;
 uint16_t alertColor = 0;
 volatile bool sceneDirty = true;     // something changed and the panel needs a redraw
 unsigned long lastTickMillis = 0;    // phase of the board's own 1 s clock tick
@@ -247,6 +258,7 @@ static const Glyph GLYPHS[] = {
   {'/', 3, {0x1,0x1,0x2,0x4,0x4}},
   {'%', 3, {0x5,0x1,0x2,0x4,0x5}},
   {':', 1, {0x0,0x1,0x0,0x1,0x0}},
+  {'.', 1, {0x0,0x0,0x0,0x0,0x1}},
   {' ', 2, {0x0,0x0,0x0,0x0,0x0}},
   {'-', 3, {0x0,0x0,0x7,0x0,0x0}},
 };
@@ -346,6 +358,8 @@ void loadPanelColors() {
   prefs.begin("scoreboard", true);
   if (prefs.getBytesLength("colors") == sizeof(panelColors)) prefs.getBytes("colors", panelColors, sizeof(panelColors));
   panelVisible = prefs.getUShort("visible", 0x01FF) & 0x01FF;
+  tickerOn = prefs.getBool("ticker", true);
+  tickerColor = prefs.getUShort("tickerColor", tickerColor);
   prefs.end();
 }
 
@@ -358,7 +372,13 @@ void drawAlertFrame(unsigned long elapsed) {
   }
   int textX = PANEL_RES_X - (int)(elapsed / ALERT_MS_PER_PX);
   drawText(frame, textX, 12, alertText, alertColor, 3);
-  if (alertUsesIcon) {                           // the icon rides in front of the text
+  if (alertUsesIcon && alertIconIsBig) {         // the 32 x 32 icon rides in front of the text, centered on the panel's height
+    int iconX = textX - 35, iconY = (PANEL_RES_Y - 32) / 2;
+    for (int r = 0; r < 32; r++) for (int c = 0; c < 32; c++) {
+      uint16_t px = alertIconBig[r * 32 + c];
+      if (px) frame->drawPixel(iconX + c, iconY + r, px);
+    }
+  } else if (alertUsesIcon) {                    // the 16 x 16 icon
     int iconX = textX - 19, iconY = 12;
     for (int r = 0; r < 16; r++) for (int c = 0; c < 16; c++) {
       uint16_t px = alertIcon[r * 16 + c];
@@ -385,17 +405,44 @@ void drawScore(int value, int centerX, uint16_t color) {
   drawText(frame, centerX - textUnits(text) * 3 / 2, 13, text, color, 3);
 }
 
+// The clock runs and is in its last minute, with the ticker switched on.
+static inline bool tickerActive() { return tickerOn && isTimerRunning && timerMin == 0; }
+
 // Draws the whole scoreboard off-screen, then copies it to the panel. Call with stateMutex held.
 void drawScoreboard() {
   frame->fillScreen(0);
 
   // top strip, from the header bytes (always delivered, unlike the optional text):
   // timer on the left (green while running, orange when stopped), period on the right
+  String periodText = String(period) + "/" + String(totalPeriods);
+  int periodX = 78 - textUnits(periodText) * 2;
   char clock[6];
   snprintf(clock, sizeof(clock), "%02d:%02d", timerMin, timerSec);
-  if (shown(COLOR_TIMER_RUNNING)) drawText(frame, 2, 1, String(clock), panelColors[isTimerRunning ? COLOR_TIMER_RUNNING : COLOR_TIMER_STOPPED], 2);
-  String periodText = String(period) + "/" + String(totalPeriods);
-  if (shown(COLOR_PERIOD)) drawText(frame, 78 - textUnits(periodText) * 2, 1, periodText, panelColors[COLOR_PERIOD], 2);
+  String mainClock = String(clock), ticks = "";
+  int tickX = 0;
+  if (tickerActive() && shown(COLOR_TIMER_RUNNING)) {
+    // last minute: whole seconds counted down and hundredths, both at the clock's size. The leading zeros give way when the period text is wide:
+    // 00:41.36, else 0:41.36, else 41.36.
+    unsigned long elapsed = millis() - lastTickMillis;
+    long remaining = (long)timerSec * 1000 - (long)(elapsed > 1000 ? 1000 : elapsed);
+    if (remaining < 0) remaining = 0;
+    int wholeSeconds = remaining / 1000, hundredths = (remaining % 1000) / 10;
+    char tenths[4];
+    snprintf(tenths, sizeof(tenths), ".%02d", hundredths);
+    ticks = String(tenths);
+    char formats[3][6];
+    snprintf(formats[0], 6, "00:%02d", wholeSeconds);
+    snprintf(formats[1], 6, "0:%02d", wholeSeconds);
+    snprintf(formats[2], 6, "%d", wholeSeconds);
+    for (int i = 0; i < 3; i++) {
+      mainClock = String(formats[i]);
+      tickX = 2 + textUnits(mainClock) * 2 + 2;
+      if (!shown(COLOR_PERIOD) || tickX + textUnits(ticks) * 2 + 3 <= periodX) break;
+    }
+  }
+  if (shown(COLOR_TIMER_RUNNING)) drawText(frame, 2, 1, mainClock, panelColors[isTimerRunning ? COLOR_TIMER_RUNNING : COLOR_TIMER_STOPPED], 2);
+  if (ticks.length()) drawText(frame, tickX, 1, ticks, tickerColor, 2);
+  if (shown(COLOR_PERIOD)) drawText(frame, periodX, 1, periodText, panelColors[COLOR_PERIOD], 2);
 
   frame->drawFastVLine(40, 12, 26, c565(40, 40, 40));   // between the two teams
 
@@ -462,7 +509,7 @@ static uint8_t mirrorPeerBattery = 255;
 static volatile bool mirrorPersistPending = false, mirrorAcceptPending = false, mirrorNoticePending = false, mirrorClearPending = false;
 static const uint8_t mirrorBroadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-static void handleState(const uint8_t* rawData, size_t dataLength);
+static void handleState(const uint8_t* rawData, size_t dataLength, bool viaMirror = false);
 static void handleConfig(const uint8_t* data, size_t len, bool viaMirror);
 
 static void mirrorAddPeer(const uint8_t *mac) {
@@ -507,7 +554,7 @@ static void mirrorOnReceive(const esp_now_recv_info_t *info, const uint8_t *data
   }
   if (mirrorRole == MIRROR_NONE || memcmp(src, mirrorPeer, 6) != 0) return;     // only the linked partner is heard
   switch (type) {
-    case MIRROR_PKT_STATE:  if (mirrorRole == MIRROR_FOLLOWER) { handleState(data + 1, len - 1); mirrorLastHeard = millis(); } break;
+    case MIRROR_PKT_STATE:  if (mirrorRole == MIRROR_FOLLOWER) { handleState(data + 1, len - 1, true); mirrorLastHeard = millis(); } break;
     case MIRROR_PKT_CONFIG: if (mirrorRole == MIRROR_FOLLOWER) { handleConfig(data + 1, len - 1, true); mirrorLastHeard = millis(); } break;
     case MIRROR_PKT_BEAT:   if (mirrorRole == MIRROR_SOURCE && len >= 2) { mirrorLastHeard = millis(); mirrorPeerBattery = data[1]; } break;
     case MIRROR_PKT_UNLINK: mirrorClearPending = true; break;
@@ -644,7 +691,7 @@ static void mirrorService() {
 }
 
 // The state packet from the phone, or relayed by the first board when this one mirrors it.
-static void handleState(const uint8_t* rawData, size_t dataLength) {
+static void handleState(const uint8_t* rawData, size_t dataLength, bool viaMirror) {
     if (dataLength >= 8) {
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         hasReceivedState = true;
@@ -652,11 +699,16 @@ static void handleState(const uint8_t* rawData, size_t dataLength) {
         awayScore      = rawData[1];
         period         = rawData[2];
         brightness     = constrain(rawData[3], 10, 120); // same range as the app's stepper
-        timerMin       = rawData[4];
-        timerSec       = rawData[5];
+        // A running clock that already agrees (within a second) with what the first board relays keeps its own tick phase,
+        // so the second board's seconds and hundredths do not jump back every time the first board refreshes it.
+        bool keepPhase = viaMirror && isTimerRunning && rawData[6] == 1 && abs((timerMin * 60 + timerSec) - (rawData[4] * 60 + rawData[5])) <= 1;
+        if (!keepPhase) {
+            timerMin       = rawData[4];
+            timerSec       = rawData[5];
+            lastTickMillis = millis();   // line the board's own seconds up with the phone's
+        }
         isTimerRunning = (rawData[6] == 1);
         totalPeriods   = rawData[7];
-        lastTickMillis = millis();   // line the board's own seconds up with the phone's
 
         dma_display->setBrightness8(brightness);
 
@@ -777,6 +829,36 @@ static void handleConfig(const uint8_t* data, size_t len, bool viaMirror) {
             reply(CMD_ALERT_ICON, CFG_OK);
             break;
         }
+        case CMD_TICKER: {
+            if (len != 2 || data[1] > 1) { reply(CMD_TICKER, CFG_BAD_ARG); return; }
+            tickerOn = (data[1] == 1);
+            sceneDirty = true;
+            prefs.begin("scoreboard", false); prefs.putBool("ticker", tickerOn); prefs.end();
+            reply(CMD_TICKER, CFG_OK);
+            break;
+        }
+        case CMD_TICKER_COLOR: {
+            if (len != 3) { reply(CMD_TICKER_COLOR, CFG_BAD_ARG); return; }
+            tickerColor = ((uint16_t)data[1] << 8) | data[2];
+            sceneDirty = true;
+            prefs.begin("scoreboard", false); prefs.putUShort("tickerColor", tickerColor); prefs.end();
+            reply(CMD_TICKER_COLOR, CFG_OK);
+            break;
+        }
+        case CMD_ALERT_ICON_BIG: {
+            if (len == 1) { alertIconBigRows = 0; reply(CMD_ALERT_ICON_BIG, CFG_OK); break; }      // remove the big icon
+            size_t rows = (len >= 2) ? (len - 2) / 64 : 0;
+            if (len < 66 || (len - 2) % 64 != 0 || data[1] > 31 || data[1] + rows > 32) { reply(CMD_ALERT_ICON_BIG, CFG_BAD_ARG); return; }
+            for (size_t r = 0; r < rows; r++) {
+                for (int c = 0; c < 32; c++) {
+                    const uint8_t *px = &data[2 + r * 64 + c * 2];
+                    alertIconBig[(data[1] + r) * 32 + c] = ((uint16_t)px[0] << 8) | px[1];
+                }
+                alertIconBigRows |= (uint32_t)(1u << (data[1] + r));
+            }
+            reply(CMD_ALERT_ICON_BIG, CFG_OK);
+            break;
+        }
         case CMD_ALERT: {
             size_t textLen = len - 2;
             bool valid = len >= 3 && textLen <= ALERT_TEXT_MAX && (data[1] == 1 || data[1] == 2 || data[1] == 3);
@@ -797,7 +879,8 @@ static void handleConfig(const uint8_t* data, size_t len, bool viaMirror) {
             for (size_t i = 2; i < len; i++) { alertText += (char)data[i]; }
             alertText.toUpperCase();
             alertColor = panelColors[isPeriod ? COLOR_ALERT_PERIOD : COLOR_ALERT_GAME];
-            alertUsesIcon = (data[1] == 3 && alertIconRows == 0xFFFF);
+            alertIconIsBig = (data[1] == 3 && alertIconBigRows == 0xFFFFFFFFu);
+            alertUsesIcon = (data[1] == 3 && (alertIconIsBig || alertIconRows == 0xFFFF));
             alertStartMillis = millis();
             alertActive = true;
             xSemaphoreGive(stateMutex);
@@ -832,7 +915,7 @@ class ConfigCallbacks: public BLECharacteristicCallbacks {
         }
         handleConfig(data, len, false);
         switch (data[0]) {      // everything that changes what the panel shows goes to the second board too
-            case CMD_SET_COLORS: case CMD_SET_VISIBILITY: case CMD_END_TEXT: case CMD_NAME_ICON: case CMD_ALERT_ICON: case CMD_ALERT:
+            case CMD_SET_COLORS: case CMD_SET_VISIBILITY: case CMD_END_TEXT: case CMD_NAME_ICON: case CMD_ALERT_ICON: case CMD_ALERT_ICON_BIG: case CMD_TICKER: case CMD_TICKER_COLOR: case CMD_ALERT:
                 mirrorForward(MIRROR_PKT_CONFIG, data, len);
         }
     }
@@ -1175,6 +1258,7 @@ void loop() {
     }
     sceneDirty = true;
   }
+  if (tickerActive() && currentMillis - lastTickerDraw >= 30) { lastTickerDraw = currentMillis; sceneDirty = true; }   // the hundredths change faster than the seconds
   if (currentMillis - lastMarqueeStep >= MARQUEE_STEP_MS) {
     lastMarqueeStep = currentMillis;
     bool movedHome = marqueeStep(homeMarquee), movedAway = marqueeStep(awayMarquee);

@@ -8,6 +8,9 @@ This repository contains the resilient, optimized C++ firmware required to trans
 - **Persistent Naming & Renaming:** Allows users to name their board dynamically from the smartphone remote (e.g., *"Juan's Board"*). The string is saved securely to non-volatile internal flash memory using the `Preferences` library and automatically updates the BLE broadcast identity profile.
 - **Configurable Colors:** The phone app sets the color of the timer (running and stopped), the period, each team's name and score, and the two start alerts. The board saves them in flash (`CMD_SET_COLORS`), so they survive reboots. A visibility bitmask (`CMD_SET_VISIBILITY`) hides any element, including either start alert, and is saved in flash too.
 - **Start Alerts:** When the app starts a game or period it sends `CMD_ALERT`: the border flashes and the message scrolls across the whole panel at 3x in the alert's color, then the scoreboard returns.
+- **Second display:** A first board relays everything it gets from the phone (state, colors, alerts, pictures) to a second board over ESP-NOW, so one board per side of the field shows the same scoreboard while the phone keeps a single Bluetooth link. Link them from the app (`CMD_MIRROR`) and hold BOOT for 2 s on the second board. A linked board does not join Wi-Fi.
+- **Goal icon and hundredths:** The goal alert scrolls a 32 x 32 emoji (`CMD_ALERT_ICON_BIG`; the 16 x 16 `CMD_ALERT_ICON` stays as the fallback). In the last minute of a period the clock gets hundredths of a second at its own size and color (`CMD_TICKER`, `CMD_TICKER_COLOR`).
+- **Panel driver presets:** 12 driver settings (saved per board, `CMD_PANEL`) with a BOOT-button diagnose mode; see "Choosing the panel's driver setting".
 - **Smart Connection Recovery & Timeout:** 
   - *Searching:* Onboard RGB NeoPixel blinks **Solid Blue**.
   - *Connected:* Transitions cleanly to **Solid Green**.
@@ -128,9 +131,11 @@ Panel behavior:
 | 2 | Timer running | |
 | 3 | Period | |
 | 4 | Battery % | 0-100 |
-| 5 | Flags | bit 0 = battery below 15%, bit 1 = a new name is staged |
-| 6 | Protocol version | currently `9`; the app uses it only to know which commands the board understands |
+| 5 | Flags | bit 0 = battery below 15%, bit 1 = a new name is staged, bit 2 = feeds a second board, bit 3 = that board answered lately, bit 4 = follows another board, bit 5 = looking for a second board |
+| 6 | Protocol version | currently `12`; the app uses it only to know which commands the board understands |
 | 7-9 | Firmware version | major, minor, patch (for example `1`, `0`, `0` is version 1.0.0); absent on firmware older than 1.0.0 |
+| 10 | Second board's battery | 1-100, or `255` when there is no second board or it did not answer (protocol 10) |
+| 11 | Panel preset | 0-11, the driver setting in use (protocol 11) |
 
 The app shows "firmware outdated" when it receives a shorter packet or a lower version than it expects. Bump `PROTOCOL_VERSION` in the sketch and `expectedProtocolVersion` in the app together whenever a layout changes.
 
@@ -148,6 +153,11 @@ Write `[command, args...]` to the config characteristic; each command is answere
 | `0x06` Alert icon | `06`, first row (0-15) + 1-4 rows of 16 pixels (RGB565, big-endian, 32 bytes per row); `06` alone removes it | Loads the 16x16 picture that the goal alert (`04` type `3`) scrolls in front of its text |
 | `0x07` Name icon | `07`, slot (0-3), first row (0-9) + 1-5 rows of 10 pixels (RGB565, big-endian, 20 bytes per row); `07`, slot alone clears it | Loads a 10x10 emoji picture. A team name (and a goal alert) shows picture N where it holds the byte N: slots 0-1 are the home name, 2-3 the away name |
 | `0x08` End text | `08` + 1-32 ASCII characters | The text the board scrolls by itself when the last period runs out (protocol 9). The app sends it in its language |
+| `0x09` Mirror | `09`, `01` look for a second board (60 s), `02` stop looking, `03` unlink it | Links or unlinks the board that mirrors this one over ESP-NOW (protocol 10). Everything that changes the panel is relayed to it |
+| `0x0A` Panel preset | `0A`, preset 0-11 | Saves the panel driver setting (see "Choosing the panel's driver setting") and restarts the board; not relayed to the second board (protocol 11) |
+| `0x0B` Ticker | `0B`, `00` or `01` | Hundredths of a second next to the clock in the last minute, saved in flash, on by default (protocol 12) |
+| `0x0C` Big alert icon | `0C`, first row (0-31) + 1-2 rows of 32 pixels (RGB565, big-endian, 64 bytes per row); `0C` alone removes it | Loads the 32x32 picture the goal alert scrolls in front of its text, centered on the panel's height (protocol 12) |
+| `0x0D` Ticker color | `0D` + RGB565 (2 bytes, big-endian) | The color of those hundredths, saved in flash, red by default (protocol 12) |
 
 ### Connection states
 After the first state packet of a session, an unexpected disconnect starts a 30 second cyan "retrying" window for the same phone. If no state was received yet, or the window expires, the board returns to blue "searching" and resets the display.
