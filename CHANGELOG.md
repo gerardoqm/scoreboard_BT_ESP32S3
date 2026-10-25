@@ -2,6 +2,14 @@
 
 Versions follow `major.minor.patch` (see the Versions section of the README).
 
+## 1.5.1
+- Diagnose mode: a short BOOT press now restarts straight into the next preset's test pattern (before, the board started normally and BOOT had to be pressed again within 2 seconds).
+
+## 1.5.0
+- Panel driver setting and diagnose mode. A HUB75 panel cannot tell the board which driver chip it has, so the right setting is found by eye. 12 presets (the six chips of the display library, each with the clock phase normal or inverted); preset 0 is what the firmware always used, so a board that is never changed behaves as before.
+- Diagnose mode: press BOOT in the first 2 seconds after power-up (the LED blinks white). The panel shows the preset's name over colour bands, a border and a diagonal. A short BOOT press saves the next preset and restarts, holding BOOT for 3 seconds leaves. (Holding BOOT while powering on would start the ROM loader instead.)
+- New command `CMD_PANEL` (0x0A): `[0x0A, preset]` saves the preset and restarts the board; the app's Panel type page uses it. Telemetry byte 11 is the current preset. Protocol version 11. The setting belongs to that board and is not sent to a linked second board.
+
 ## 1.4.1
 - Wi-Fi networking removed: the board no longer joins a Wi-Fi network or runs `ArduinoOTA`, so `secrets.h` only needs `OTA_PASSWORD` (the Bluetooth update key) and no Wi-Fi password ends up in the firmware image. The board-to-board mirror (ESP-NOW) is unchanged. Update over Bluetooth or USB.
 
