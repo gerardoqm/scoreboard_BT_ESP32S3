@@ -117,13 +117,14 @@ Adafruit_NeoPixel statusLED(NUM_PIXELS, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // PROTOCOL_VERSION above is only for the app's feature checks; the version below is what people see.
 #define FW_VERSION_MAJOR 1
 #define FW_VERSION_MINOR 6
-#define FW_VERSION_PATCH 1
+#define FW_VERSION_PATCH 5
 #define FLAG_LOW_BATTERY    0x01  // battery below 15%
 #define FLAG_RENAME_STAGED  0x02  // a name is staged and waiting for APPLY
 #define FLAG_MIRROR_SOURCE  0x04  // this board feeds a second board
 #define FLAG_MIRROR_ONLINE  0x08  // ... and that board answered in the last few seconds
 #define FLAG_MIRROR_FOLLOWER 0x10 // this board follows another board instead of the phone
 #define FLAG_MIRROR_PAIRING 0x20  // looking for a second board
+#define FLAG_MIRROR_SYNCED  0x40  // the second board confirmed that it has the picture (it reports it in its heartbeat)
 
 // Panel layout (80x40), 3x5 pixel font: timer (left) and period (right) at 2x on top, scores at 3x in the
 // middle, team names at 2x along the bottom. No frame.
@@ -492,7 +493,7 @@ class ScoreboardServerCallbacks: public BLEServerCallbacks {
 #define MIRROR_BOOT_PIN       0
 #define MIRROR_PKT_STATE      1        // [1] + the phone's state packet
 #define MIRROR_PKT_CONFIG     2        // [2] + a config command
-#define MIRROR_PKT_BEAT       3        // [3, battery%] follower -> source
+#define MIRROR_PKT_BEAT       3        // [3, battery%, bit 0 = has received a picture] follower -> source
 #define MIRROR_PKT_BEACON     4        // source looking for a partner (broadcast)
 #define MIRROR_PKT_ACCEPT     5        // follower -> source: linked
 #define MIRROR_PKT_UNLINK     6
@@ -506,6 +507,8 @@ static bool mirrorListening = false;             // follower: waiting for a beac
 static unsigned long mirrorWindowEnd = 0;
 static unsigned long mirrorLastHeard = 0;
 static uint8_t mirrorPeerBattery = 255;
+static volatile bool mirrorPeerSynced = false;   // the follower says it has a picture; until then the source keeps sending everything
+static unsigned long mirrorLastFullSync = 0;
 static volatile bool mirrorPersistPending = false, mirrorAcceptPending = false, mirrorNoticePending = false, mirrorClearPending = false;
 static const uint8_t mirrorBroadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -533,13 +536,94 @@ static void mirrorSend(const uint8_t *mac, uint8_t type, const uint8_t *data, si
   }
 }
 
+static bool mirrorOnline();
+
+// Delivery queue (source -> follower). Packets leave one at a time, in order, and each waits for the radio's verdict (the send callback):
+// a packet that was not acknowledged is sent again, up to 3 tries. The BLE and loop tasks only add packets and never wait.
+//  - a state packet is replaced by a newer one still in the queue, and a failed one is rebuilt from the board's current state (never an old picture);
+//  - a command that cannot be delivered (or is older than 1.5 s) is dropped and the follower is marked "has no picture", so the next heartbeat starts a full sync.
+struct MirrorOut { uint8_t type; uint8_t len; uint8_t tries; unsigned long queuedAt; uint8_t data[150]; };
+#define MIRROR_QUEUE 64
+static MirrorOut mirrorQueue[MIRROR_QUEUE];
+static int mirrorQHead = 0, mirrorQCount = 0;
+static portMUX_TYPE mirrorQMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool mirrorInFlight = false;       // a packet was handed to the radio and its verdict is awaited
+static volatile int8_t mirrorSendResult = 0;       // 0 = awaited, 1 = acknowledged by the other board, -1 = failed
+static unsigned long mirrorSentAt = 0;
+static volatile bool mirrorStateRebuild = false;
+static uint32_t mirrorRetries = 0, mirrorDropped = 0;
+
+static void mirrorEnqueue(uint8_t type, const uint8_t *data, size_t len) {
+  if (mirrorRole != MIRROR_SOURCE || !mirrorReady || len > sizeof(MirrorOut::data) || !mirrorOnline()) return;   // an absent board is caught up by a full sync when it returns
+  portENTER_CRITICAL(&mirrorQMux);
+  if (type == MIRROR_PKT_STATE) {
+    for (int i = mirrorInFlight ? 1 : 0; i < mirrorQCount; i++) {                 // a newer picture replaces one that is still waiting
+      MirrorOut &e = mirrorQueue[(mirrorQHead + i) % MIRROR_QUEUE];
+      if (e.type == MIRROR_PKT_STATE) { memcpy(e.data, data, len); e.len = len; e.tries = 0; e.queuedAt = millis(); portEXIT_CRITICAL(&mirrorQMux); return; }
+    }
+  }
+  if (mirrorQCount >= MIRROR_QUEUE) { mirrorDropped++; mirrorPeerSynced = false; portEXIT_CRITICAL(&mirrorQMux); return; }
+  MirrorOut &e = mirrorQueue[(mirrorQHead + mirrorQCount) % MIRROR_QUEUE];
+  e.type = type; e.len = len; e.tries = 0; e.queuedAt = millis();
+  memcpy(e.data, data, len);
+  mirrorQCount++;
+  portEXIT_CRITICAL(&mirrorQMux);
+}
+
 // Phone -> board 1 -> board 2.
-static void mirrorForward(uint8_t type, const uint8_t *data, size_t len) {
-  if (mirrorRole == MIRROR_SOURCE) mirrorSend(mirrorPeer, type, data, len);
+static void mirrorForward(uint8_t type, const uint8_t *data, size_t len) { mirrorEnqueue(type, data, len); }
+
+static void mirrorSendState();
+
+// Called from loop(): checks the verdict on the packet in flight and hands the next one to the radio.
+static void mirrorPump() {
+  if (mirrorRole != MIRROR_SOURCE || !mirrorReady) { mirrorQCount = 0; mirrorInFlight = false; return; }
+  unsigned long now = millis();
+  if (mirrorInFlight) {
+    if (mirrorSendResult == 0 && now - mirrorSentAt < 150) return;                // still waiting for the radio
+    bool ok = (mirrorSendResult == 1);
+    mirrorInFlight = false;
+    portENTER_CRITICAL(&mirrorQMux);
+    if (mirrorQCount > 0) {
+      MirrorOut &e = mirrorQueue[mirrorQHead];
+      bool drop = ok;
+      if (!ok) {
+        mirrorRetries++;
+        e.tries++;
+        bool wasState = (e.type == MIRROR_PKT_STATE);
+        if (wasState || e.tries >= 3 || now - e.queuedAt > 1500) {
+          drop = true;
+          if (wasState) mirrorStateRebuild = true; else { mirrorDropped++; mirrorPeerSynced = false; }
+        }
+      }
+      if (drop) { mirrorQHead = (mirrorQHead + 1) % MIRROR_QUEUE; mirrorQCount--; }
+    }
+    portEXIT_CRITICAL(&mirrorQMux);
+  }
+  if (mirrorStateRebuild) { mirrorStateRebuild = false; if (mirrorOnline()) mirrorSendState(); }
+  if (!mirrorInFlight && mirrorQCount > 0) {
+    uint8_t buf[160];
+    size_t n = 0;
+    portENTER_CRITICAL(&mirrorQMux);
+    MirrorOut &e = mirrorQueue[mirrorQHead];
+    buf[n++] = e.type; memcpy(buf + 1, e.data, e.len); n += e.len;
+    portEXIT_CRITICAL(&mirrorQMux);
+    mirrorSendResult = 0; mirrorInFlight = true; mirrorSentAt = now;
+    if (esp_now_send(mirrorPeer, buf, n) != ESP_OK) mirrorSendResult = -1;        // the radio would not take it: the same as a failed delivery
+  }
+}
+
+// Counters for the serial log (every 5 s): packets sent and whether the other board acknowledged them, packets heard by type.
+static volatile uint32_t mirrorSentOk = 0, mirrorSentFail = 0, mirrorHeard[8] = {0}, mirrorIgnored = 0;
+
+static void mirrorOnSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  if (status == ESP_NOW_SEND_SUCCESS) mirrorSentOk++; else mirrorSentFail++;
+  if (mirrorInFlight && mirrorSendResult == 0) mirrorSendResult = (status == ESP_NOW_SEND_SUCCESS) ? 1 : -1;
 }
 
 static void mirrorOnReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
+  if (data[0] < 8) mirrorHeard[data[0]]++;
   const uint8_t *src = info->src_addr;
   uint8_t type = data[0];
   if ((type == MIRROR_PKT_BEACON && mirrorListening) || (type == MIRROR_PKT_ACCEPT && mirrorPairing)) {
@@ -552,11 +636,11 @@ static void mirrorOnReceive(const esp_now_recv_info_t *info, const uint8_t *data
     if (type == MIRROR_PKT_BEACON) mirrorAcceptPending = true;
     return;
   }
-  if (mirrorRole == MIRROR_NONE || memcmp(src, mirrorPeer, 6) != 0) return;     // only the linked partner is heard
+  if (mirrorRole == MIRROR_NONE || memcmp(src, mirrorPeer, 6) != 0) { mirrorIgnored++; return; }     // only the linked partner is heard
   switch (type) {
     case MIRROR_PKT_STATE:  if (mirrorRole == MIRROR_FOLLOWER) { handleState(data + 1, len - 1, true); mirrorLastHeard = millis(); } break;
     case MIRROR_PKT_CONFIG: if (mirrorRole == MIRROR_FOLLOWER) { handleConfig(data + 1, len - 1, true); mirrorLastHeard = millis(); } break;
-    case MIRROR_PKT_BEAT:   if (mirrorRole == MIRROR_SOURCE && len >= 2) { mirrorLastHeard = millis(); mirrorPeerBattery = data[1]; } break;
+    case MIRROR_PKT_BEAT:   if (mirrorRole == MIRROR_SOURCE && len >= 2) { mirrorLastHeard = millis(); mirrorPeerBattery = data[1]; mirrorPeerSynced = len >= 3 && (data[2] & 1); } break;
     case MIRROR_PKT_UNLINK: mirrorClearPending = true; break;
   }
 }
@@ -570,6 +654,7 @@ static void mirrorStartRadio() {
   esp_wifi_set_channel(MIRROR_CHANNEL, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init() != ESP_OK) { Serial.println("[mirror] ESP-NOW failed to start"); return; }
   esp_now_register_recv_cb(mirrorOnReceive);
+  esp_now_register_send_cb(mirrorOnSent);
   mirrorAddPeer(mirrorBroadcast);
   if (mirrorRole != MIRROR_NONE) mirrorAddPeer(mirrorPeer);
   mirrorReady = true;
@@ -605,6 +690,7 @@ static void mirrorUnlink(bool tellPartner) {
   mirrorRole = MIRROR_NONE;
   mirrorPairing = false; mirrorListening = false;
   mirrorPeerBattery = 255;
+  mirrorPeerSynced = false;
   mirrorSave();
   Serial.println("[mirror] unlinked");
 }
@@ -632,12 +718,88 @@ static void mirrorCommand(const uint8_t *data, size_t len) {
 
 static bool mirrorOnline() { return mirrorRole == MIRROR_SOURCE && mirrorLastHeard != 0 && millis() - mirrorLastHeard < MIRROR_ONLINE_MS; }
 
+// The picture: the state packet the phone sends, rebuilt from what this board shows.
+static void mirrorSendState() {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  String names = homeName + "|" + awayName;
+  uint8_t packet[8 + 2 * NAME_MAX + 4];
+  size_t n = 0;
+  packet[n++] = homeScore; packet[n++] = awayScore; packet[n++] = period; packet[n++] = brightness;
+  packet[n++] = timerMin; packet[n++] = timerSec; packet[n++] = isTimerRunning ? 1 : 0; packet[n++] = totalPeriods;
+  for (size_t i = 0; i < names.length() && n < sizeof(packet); i++) packet[n++] = (uint8_t)names[i];
+  xSemaphoreGive(stateMutex);
+  mirrorEnqueue(MIRROR_PKT_STATE, packet, n);
+}
+
+static void mirrorSendConfig(const uint8_t *data, size_t len) { mirrorEnqueue(MIRROR_PKT_CONFIG, data, len); }
+
+// Everything the second board needs to look like this one, rebuilt from this board's own memory: colors, visibility, the hundredths
+// settings, the end text, the pictures, then the state. Sent while the second board says it has no picture yet.
+static void mirrorSendFullSync() {
+  uint8_t b[140];
+  size_t n = 0;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  b[n++] = CMD_SET_COLORS;
+  for (int i = 0; i < COLOR_COUNT; i++) { b[n++] = panelColors[i] >> 8; b[n++] = panelColors[i] & 0xFF; }
+  xSemaphoreGive(stateMutex);
+  mirrorSendConfig(b, n);
+  b[0] = CMD_SET_VISIBILITY; b[1] = panelVisible & 0xFF; b[2] = panelVisible >> 8; mirrorSendConfig(b, 3);
+  b[0] = CMD_TICKER; b[1] = tickerOn ? 1 : 0; mirrorSendConfig(b, 2);
+  b[0] = CMD_TICKER_COLOR; b[1] = tickerColor >> 8; b[2] = tickerColor & 0xFF; mirrorSendConfig(b, 3);
+  n = 0; b[n++] = CMD_END_TEXT;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  for (size_t i = 0; i < matchEndText.length() && n < 33; i++) b[n++] = (uint8_t)matchEndText[i];
+  xSemaphoreGive(stateMutex);
+  mirrorSendConfig(b, n);
+  for (int slot = 0; slot < 4; slot++) {                      // the emoji of the team names (an empty slot is cleared)
+    bool any = false;
+    for (int i = 0; i < NAME_ICON_PX * NAME_ICON_PX && !any; i++) any = nameIcons[slot][i] != 0;
+    if (!any) { b[0] = CMD_NAME_ICON; b[1] = slot; mirrorSendConfig(b, 2); continue; }
+    for (int firstRow = 0; firstRow < NAME_ICON_PX; firstRow += 5) {
+      n = 0; b[n++] = CMD_NAME_ICON; b[n++] = slot; b[n++] = firstRow;
+      for (int i = 0; i < 5 * NAME_ICON_PX; i++) { uint16_t px = nameIcons[slot][firstRow * NAME_ICON_PX + i]; b[n++] = px >> 8; b[n++] = px & 0xFF; }
+      mirrorSendConfig(b, n);
+    }
+  }
+  if (alertIconRows == 0xFFFF) {                               // the 16 x 16 goal icon, if one was loaded
+    for (int firstRow = 0; firstRow < 16; firstRow += 4) {
+      n = 0; b[n++] = CMD_ALERT_ICON; b[n++] = firstRow;
+      for (int i = 0; i < 4 * 16; i++) { uint16_t px = alertIcon[firstRow * 16 + i]; b[n++] = px >> 8; b[n++] = px & 0xFF; }
+      mirrorSendConfig(b, n);
+    }
+  }
+  if (alertIconBigRows == 0xFFFFFFFFu) {                       // and the 32 x 32 one
+    for (int firstRow = 0; firstRow < 32; firstRow += 2) {
+      n = 0; b[n++] = CMD_ALERT_ICON_BIG; b[n++] = firstRow;
+      for (int i = 0; i < 2 * 32; i++) { uint16_t px = alertIconBig[firstRow * 32 + i]; b[n++] = px >> 8; b[n++] = px & 0xFF; }
+      mirrorSendConfig(b, n);
+    }
+  }
+  mirrorSendState();
+  Serial.println("[mirror] full sync sent");
+}
+
 // Called from loop().
 static void mirrorService() {
   unsigned long now = millis();
   static unsigned long lastBeacon = 0, lastBeat = 0, bootDownAt = 0;
   static bool bootWasDown = false;
 
+  mirrorPump();
+  static bool wasOnline = false;
+  bool isOnline = mirrorOnline();
+  if (isOnline && !wasOnline) mirrorPeerSynced = false;     // it was away: it may have missed changes, so it gets everything again
+  wasOnline = isOnline;
+  static unsigned long lastMirrorLog = 0;
+  if (mirrorRole != MIRROR_NONE && now - lastMirrorLog >= 5000) {
+    lastMirrorLog = now;
+    Serial.printf("[mirror] %s: sent ok %u fail %u | heard state %u config %u beat %u unlink %u, ignored %u | scene %s, state received %s\n",
+                  mirrorRole == MIRROR_SOURCE ? "source" : "follower", (unsigned)mirrorSentOk, (unsigned)mirrorSentFail,
+                  (unsigned)mirrorHeard[MIRROR_PKT_STATE], (unsigned)mirrorHeard[MIRROR_PKT_CONFIG], (unsigned)mirrorHeard[MIRROR_PKT_BEAT],
+                  (unsigned)mirrorHeard[MIRROR_PKT_UNLINK], (unsigned)mirrorIgnored, sceneDirty ? "dirty" : "clean", hasReceivedState ? "yes" : "no");
+    if (mirrorRole == MIRROR_SOURCE) Serial.printf("[mirror] queue %d, retries %u, dropped %u\n", mirrorQCount, (unsigned)mirrorRetries, (unsigned)mirrorDropped);
+    if (mirrorRole == MIRROR_SOURCE) Serial.printf("[mirror] follower online %s, has a picture %s\n", mirrorOnline() ? "yes" : "no", mirrorPeerSynced ? "yes" : "no");
+  }
   if (mirrorClearPending) { mirrorClearPending = false; mirrorUnlink(false); }
   if (mirrorPersistPending) { mirrorPersistPending = false; mirrorSave(); Serial.println("[mirror] linked"); }
   if (mirrorAcceptPending) { mirrorAcceptPending = false; mirrorSend(mirrorPeer, MIRROR_PKT_ACCEPT, nullptr, 0); }
@@ -675,17 +837,13 @@ static void mirrorService() {
     if (mirrorRole == MIRROR_FOLLOWER) {
       uint8_t battery = (uint8_t)readBatteryPercentage();
       if (!batteryKnown) battery = 255;          // no battery wired, or the reading keeps failing
-      mirrorSend(mirrorPeer, MIRROR_PKT_BEAT, &battery, 1);
-    } else if (hasReceivedState) {            // full refresh: the partner catches up after a lost packet or a late power-on
-      xSemaphoreTake(stateMutex, portMAX_DELAY);
-      String names = homeName + "|" + awayName;
-      uint8_t packet[8 + 2 * NAME_MAX + 4];
-      size_t n = 0;
-      packet[n++] = homeScore; packet[n++] = awayScore; packet[n++] = period; packet[n++] = brightness;
-      packet[n++] = timerMin; packet[n++] = timerSec; packet[n++] = isTimerRunning ? 1 : 0; packet[n++] = totalPeriods;
-      for (size_t i = 0; i < names.length() && n < sizeof(packet); i++) packet[n++] = (uint8_t)names[i];
-      xSemaphoreGive(stateMutex);
-      mirrorSend(mirrorPeer, MIRROR_PKT_STATE, packet, n);
+      uint8_t beat[2] = { battery, (uint8_t)(hasReceivedState ? 1 : 0) };      // and whether it has a picture yet
+      mirrorSend(mirrorPeer, MIRROR_PKT_BEAT, beat, 2);
+    } else if (mirrorOnline() && !mirrorPeerSynced && now - mirrorLastFullSync >= 2000) {
+      mirrorLastFullSync = now;               // the second board has no picture: send it everything, again every 2 s until it confirms
+      mirrorSendFullSync();
+    } else if (hasReceivedState) {            // refresh: the partner catches up after a lost packet
+      mirrorSendState();
     }
   }
 }
@@ -734,8 +892,12 @@ static void handleState(const uint8_t* rawData, size_t dataLength, bool viaMirro
 
 class FullControlCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
-        handleState(pCharacteristic->getData(), pCharacteristic->getLength());
-        mirrorForward(MIRROR_PKT_STATE, pCharacteristic->getData(), pCharacteristic->getLength());
+        uint8_t copy[250];                                   // the characteristic's buffer changes under us (telemetry notifications reuse it)
+        size_t len = pCharacteristic->getLength();
+        if (len > sizeof(copy)) len = sizeof(copy);
+        memcpy(copy, pCharacteristic->getData(), len);
+        handleState(copy, len);
+        mirrorForward(MIRROR_PKT_STATE, copy, len);
     }
 };
 
@@ -903,9 +1065,13 @@ static void handleConfig(const uint8_t* data, size_t len, bool viaMirror) {
 
 class ConfigCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
-        const uint8_t* data = pCharacteristic->getData();
+        // Work on a copy: answering a command (pConfigChar->setValue) overwrites the very buffer the command sits in, so
+        // what was relayed to the second board afterwards used to be the 2-byte reply and stale bytes instead of the command.
+        uint8_t copy[250];
         size_t len = pCharacteristic->getLength();
-        if (len < 1) return;
+        if (len < 1 || len > sizeof(copy)) return;
+        memcpy(copy, pCharacteristic->getData(), len);
+        const uint8_t* data = copy;
         if (data[0] == CMD_MIRROR) { mirrorCommand(data, len); return; }
         if (data[0] == CMD_PANEL) {         // [CMD_PANEL, preset]: this board only, not relayed to the second one
             uint8_t resp[2] = { CMD_PANEL, (uint8_t)((len == 2 && data[1] < PANEL_PRESETS) ? CFG_OK : CFG_BAD_ARG) };
@@ -1282,9 +1448,21 @@ void loop() {
      // FIXED: Added array assignment tracking brackets to structure multi-byte list payloads
      uint8_t flags = (batteryPct < 15 ? FLAG_LOW_BATTERY : 0) | (pendingDeviceName.length() > 0 ? FLAG_RENAME_STAGED : 0)
                      | (mirrorRole == MIRROR_SOURCE ? FLAG_MIRROR_SOURCE : 0) | (mirrorOnline() ? FLAG_MIRROR_ONLINE : 0)
-                     | (mirrorRole == MIRROR_FOLLOWER ? FLAG_MIRROR_FOLLOWER : 0) | (mirrorPairing ? FLAG_MIRROR_PAIRING : 0);
+                     | (mirrorRole == MIRROR_SOURCE && mirrorOnline() && mirrorPeerSynced ? FLAG_MIRROR_SYNCED : 0) | (mirrorRole == MIRROR_FOLLOWER ? FLAG_MIRROR_FOLLOWER : 0) | (mirrorPairing ? FLAG_MIRROR_PAIRING : 0);
      uint8_t telemetryPacket[] = { (uint8_t)timerMin, (uint8_t)timerSec, (uint8_t)(isTimerRunning ? 1 : 0), (uint8_t)period, (uint8_t)batteryPct, flags, PROTOCOL_VERSION, FW_VERSION_MAJOR, FW_VERSION_MINOR, FW_VERSION_PATCH, (uint8_t)(mirrorOnline() ? mirrorPeerBattery : 255), panelPreset };
      pChar->setValue(telemetryPacket, sizeof(telemetryPacket)); pChar->notify();
+  }
+
+  // Linked as the second board: two green flashes every second, for as long as it is linked. (It never has a phone of its own to wait for,
+  // so the blue "searching" blink would be misleading.) With a phone connected straight to it, or while updating or linking, the usual colors apply.
+  static int followerLedOn = -1;
+  bool followerLed = mirrorRole == MIRROR_FOLLOWER && otaState == FWU_IDLE && !mirrorPairing && !mirrorListening && currentBLEState != LINKED_CONNECTED;
+  if (followerLed) {
+    unsigned long phase = currentMillis % 1000;
+    int on = (phase < 120 || (phase >= 240 && phase < 360)) ? 1 : 0;
+    if (on != followerLedOn) { followerLedOn = on; statusLED.setPixelColor(0, on ? statusLED.Color(0, 150, 0) : statusLED.Color(0, 0, 0)); statusLED.show(); }
+  } else {
+    followerLedOn = -1;
   }
 
   if (currentMillis - lastBlinkMillis >= (otaState != FWU_IDLE ? 250 : 400)) {
@@ -1300,6 +1478,9 @@ void loop() {
     else if (currentBLEState == LINKED_CONNECTED) {  // back to solid green (an update may have just ended or failed)
       statusLED.setPixelColor(0, statusLED.Color(0, 150, 0)); statusLED.show();
     }
+    else if (followerLed) {
+      // the two green flashes are drawn above, every pass of loop()
+    }
     else if (currentBLEState == SEARCHING_NEW) {
       statusLED.setPixelColor(0, blinkToggleState ? statusLED.Color(0, 0, 200) : statusLED.Color(0, 0, 0)); statusLED.show();
     } 
@@ -1307,6 +1488,7 @@ void loop() {
       statusLED.setPixelColor(0, blinkToggleState ? statusLED.Color(0, 150, 200) : statusLED.Color(0, 0, 0)); statusLED.show();
       if (currentMillis - stateTransitionMillis >= 30000) {
         currentBLEState = SEARCHING_NEW;
+        if (mirrorRole == MIRROR_FOLLOWER) return;       // a second board keeps showing what the first board sends
         xSemaphoreTake(stateMutex, portMAX_DELAY);
         hasReceivedState = false;
         homeScore = 0; awayScore = 0; period = 1; totalPeriods = 4; homeName = "HOME"; awayName = "AWAY";
