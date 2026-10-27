@@ -2,6 +2,20 @@
 
 Versions follow `major.minor.patch` (see the Versions section of the README).
 
+## 1.6.5
+- Reliable delivery to the second board. What the first board relays now goes through a queue that sends one packet at a time and waits for the radio's verdict: a packet that was not acknowledged is sent again (up to 3 tries). A newer state replaces one still waiting, and a failed state is rebuilt from the board's current state, never resent as an old picture. A command that cannot be delivered (or is older than 1.5 s) makes the first board start a full sync. When the second board comes back after being away, it gets everything again. The first board never waits: its own panel is drawn at once.
+
+## 1.6.4
+- The second board now receives the commands the first board relays. The first board answered a command by overwriting the very buffer the command was in, and then relayed that buffer, so the second board got the reply instead of the command: goal, period and match alerts were rejected, and the emoji pictures of the team names arrived half loaded (cut in half). The commands (and the state) are copied before they are handled.
+
+## 1.6.3
+- The second board confirms that it has the picture: its heartbeat now says whether it has received a state. While it says no, the first board sends it everything it needs, rebuilt from its own memory (colors, visibility, the hundredths settings, the end text, the emoji pictures, then the state), again every 2 s until the second board confirms, so a board that powers up late or misses packets recovers by itself. The telemetry flags get bit 6, "the second board has the picture", which the app shows as "Mirroring" (and "Syncing" until then).
+- Serial log (every 5 s) of the packets exchanged between the boards: sent and acknowledged, heard by type, to find out where a link breaks.
+
+## 1.6.2
+- Status LED of a linked second board: two green flashes every second while it is linked (it used to keep the blue "searching for a phone" blink, which was confusing). Unlinked, it goes back to the usual colors. A phone connected straight to it still shows solid green, and linking, updating and the purple "looking for a partner" blink keep their colors.
+- A second board no longer wipes its display when a phone that was connected straight to it (for an update) goes away.
+
 ## 1.6.1
 - The hundredths of a second are as big as the clock's digits (`00:41.36`, dropping the leading zeros when the period text is wide: `0:41.36`, `41.36`) and have their own color: new command `CMD_TICKER_COLOR` (0x0D, RGB565, saved in flash, red by default). Protocol version 12 as in 1.6.0.
 
